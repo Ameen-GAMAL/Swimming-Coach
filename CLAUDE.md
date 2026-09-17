@@ -1,0 +1,586 @@
+# Swimming Performance Tracking — Proof of Concept
+
+## 1. What we are building
+
+A command-line tool plus a small web page that takes a recorded video of a
+25 m swimming pool, finds the swimmers, follows each one through the water,
+detects when their hands enter and leave the water, and from that calculates
+how fast they swam, how many stroke cycles they took, and how far they
+travelled per cycle.
+
+The output is a CSV of measurements plus an annotated video that shows the
+measurement grid, the tracked swimmers, and the detected events drawn on top
+of the original footage.
+
+This is a **proof of concept**. The goal is to show the client that the
+approach works and to establish what the accuracy ceiling is with the video
+we have. It is not the production system.
+
+---
+
+## 2. Scope
+
+### In scope
+- **Freestyle only.** No backstroke, breaststroke, or butterfly.
+- **Multi-lane.** Several swimmers visible at once, each tracked separately.
+- **25 m pool.**
+- **Post-session processing.** The video is a file on disk. Nothing is live.
+- Two measurements from the client spec: **stroke rate** and **distance per cycle**.
+- Plus: clean-swim time, average speed, cycle-time variation.
+
+### Out of scope
+- Real-time processing
+- Other strokes
+- User accounts, authentication, databases
+- Cloud deployment
+- Comparing swimmers against a real professional dataset (we do not have one)
+
+### Explicitly deferred
+Do not build abstraction layers, plugin systems, or configuration hooks for
+features that are out of scope. If a future need is obvious, write one line in
+`README.md` about it. Do not write code for it.
+
+---
+
+## 3. Fixed decisions — do not change these without asking
+
+| Decision | Value |
+|---|---|
+| Stroke | Freestyle |
+| Pool length | 25 m |
+| Lanes | Multiple, each swimmer assigned to a lane |
+| Frame sampling | **Every frame.** No frame skipping. |
+| Device | CUDA GPU on the local machine |
+| Model family | Ultralytics YOLO11 (detection + pose) |
+| Tracker | ByteTrack |
+| Pixel-to-metre conversion | Homography from 4 manually clicked points |
+| Lap definition | Swimmer goes to the far wall and returns |
+| Experiment tracking | MLflow, local file store |
+| Version control | Git, initialised inside the project |
+
+---
+
+## 4. Project structure
+
+Create exactly this. Do not add folders or files beyond it without asking.
+
+```
+swimming-poc/
+├── CLAUDE.md              This file
+├── README.md              How to install and run, step by step
+├── requirements.txt
+├── config.yaml            Every adjustable number lives here
+├── .gitignore
+├── run.py                 The only file the user runs
+├── app.py                 Small web page for the client demo
+├── data/
+│   ├── candidates.md      Suggested video links, for the user to approve
+│   ├── raw/               Approved videos (user puts them here)
+│   └── calibration/       One JSON per video, produced by calibrate.py
+├── src/
+│   ├── calibrate.py       Click-based setup tool
+│   ├── detect_track.py    Find swimmers, give each a stable ID
+│   ├── pose.py            Find body points on each swimmer
+│   ├── events.py          Find hand entry and exit moments
+│   ├── metrics.py         Turn events into measurements
+│   ├── render.py          Draw the annotated output video
+│   └── profiling.py       Time each stage, send results to MLflow
+├── cache/                 Intermediate results, so reruns are fast
+└── outputs/               Final CSV and annotated video
+```
+
+Eight source files. Each one does a single job. If a file starts doing two
+jobs, stop and ask before splitting it.
+
+---
+
+## 5. Code style
+
+### Comments
+Write short, direct comments in plain language. Someone who does not write
+code should be able to read a comment and understand what that part does.
+
+Good:
+```python
+# Convert the swimmer's position from pixels to metres
+# Only look at swimmers inside the pool, ignore people standing at the edge
+# A cycle is one hand entering the water twice in a row
+```
+
+Bad:
+```python
+# Apply homography transformation matrix H to coordinate vector
+# Instantiate the tracker with the configured hyperparameters
+# TODO: refactor this later
+```
+
+Comment the **why** and the **what it means**, never restate the syntax.
+One comment per logical block, not one per line.
+
+### General
+- Plain functions. No classes unless state genuinely needs to persist.
+- No `utils.py`, no `helpers.py`, no dumping grounds.
+- Every number that someone might want to change goes in `config.yaml`,
+  never hardcoded in the middle of a function.
+- Fail loudly with a clear message. If the calibration file is missing, say
+  "No calibration found for this video. Run calibrate.py first." Do not
+  silently fall back to a default.
+
+---
+
+## 6. Configuration
+
+All tunable values live in `config.yaml`. Structure it like this:
+
+```yaml
+video:
+  fps_override: null          # Leave null to read fps from the file
+
+pool:
+  length_m: 25
+  lanes: 6
+  segment_size_m: 2.5         # Size of each grid strip drawn on the video
+  clean_zone_start_m: 5       # Skip the dive and the push-off
+  clean_zone_end_m: 20        # Skip the approach to the wall
+
+detection:
+  model: yolo11m.pt
+  conf_threshold: 0.35
+  batch_size: 16
+  half_precision: true
+
+pose:
+  model: yolo11m-pose.pt
+  conf_threshold: 0.30
+  batch_size: 16
+  half_precision: true
+
+events:
+  wrist_conf_threshold: 0.40
+  min_cycle_seconds: 0.6      # Anything faster than this is noise
+  smoothing_window: 5         # Frames, to steady the wrist signal
+
+quality:
+  min_confidence: 0.90
+  min_valid_cycles: 3
+
+benchmarks:
+  provisional: true           # These are placeholder numbers, not real data
+  freestyle:
+    stroke_rate_50m: [55, 70]   # cycles per minute
+    stroke_rate_100m: [45, 60]
+    distance_per_cycle: [1.8, 2.5]   # metres
+
+mlflow:
+  tracking_uri: "file:./mlruns"
+  experiment_name: "swimming-poc"
+
+cache:
+  enabled: true
+  directory: "./cache"
+```
+
+---
+
+## 7. The calibration tool (`src/calibrate.py`)
+
+This is the most important piece for accuracy. Build it first and build it well.
+
+### What the user does
+The tool opens one frame from the video and the user clicks. Nothing is typed
+except confirmations. Every click is undoable with a key press.
+
+**Step 1 — Pool corners.**
+The user clicks 4 points on the pool whose real-world distances are known.
+Normally the four corners of the water surface. The tool then computes a
+homography so that any pixel on the water surface maps to a real position in
+metres.
+
+Show the user the grid drawn back onto the frame immediately after the fourth
+click. If the grid does not follow the pool edges, the clicks were wrong and
+the user should be able to redo them.
+
+**Step 2 — Water line per lane.**
+Perspective means the water surface is not a single horizontal line in the
+image. The near lane's water line sits lower in the picture than the far
+lane's.
+
+For each lane, the user clicks 2 points along the water surface in that lane.
+The tool stores a line per lane. This is the reference for "the hand has
+entered the water."
+
+**Step 3 — Lane boundaries.**
+The user clicks the dividing lines between lanes. This lets the system assign
+each tracked swimmer to a lane, and lets us keep a swimmer's ID stable — a
+swimmer never changes lane, so if the tracker loses someone and picks them up
+again in the same lane, it is the same person.
+
+### Output
+One JSON file per video in `data/calibration/`, named after the video. It
+contains: the 4 corner points, the homography matrix, the per-lane water
+lines, the lane boundaries, the frame number used, and the pool length.
+
+### Verification
+After calibration, save a single preview image showing the grid, water lines,
+and lane boundaries drawn over the frame. The user should be able to look at
+that one image and tell whether the calibration is right.
+
+---
+
+## 8. The processing pipeline
+
+### 8.1 Detection and tracking (`src/detect_track.py`)
+Run YOLO11 detection on every frame, person class only, in batches on the GPU.
+Discard any detection whose centre falls outside the pool area from the
+calibration. Pass the surviving detections to ByteTrack so each swimmer keeps
+a stable ID.
+
+After tracking, assign each ID to a lane using the lane boundaries. If a track
+disappears and a new one appears in the same lane shortly after, reuse the old
+ID.
+
+Cache the result keyed on video filename plus model plus thresholds.
+
+### 8.2 Pose (`src/pose.py`)
+Run YOLO11-pose on the tracked swimmers only. The pretrained model already
+outputs the points we need: nose, shoulders, elbows, wrists, hips, knees,
+ankles.
+
+**Measure before assuming.** The first thing this module reports is: in what
+percentage of frames was a wrist detected with confidence above the threshold?
+Log this as `quality_wrist_visible_pct`.
+
+- 70% or above → the pretrained model is good enough, continue
+- Below 70% → stop and report. Do not silently produce bad numbers. The
+  fallback is to annotate 300–500 frames and fine-tune the pose model, but
+  that is a separate decision the user must make.
+
+Cache the result.
+
+### 8.3 Events (`src/events.py`)
+For each swimmer, track the wrist nearest to the camera. Record which side it
+is (left or right) — with a side view the far arm is hidden by the body, so
+tracking one consistent hand is the only reliable option.
+
+Detect a **hand entry** using three signals together, not one:
+
+1. The wrist crosses that lane's water line moving downward. This is the
+   primary signal.
+2. The wrist detection confidence drops. When the hand goes under, the model
+   loses it — this confirms the entry.
+3. The wrist path over time is periodic. Use this to reject spurious events
+   that do not fit the rhythm.
+
+Smooth the wrist position over `smoothing_window` frames before looking for
+crossings. Reject any cycle shorter than `min_cycle_seconds`.
+
+A **stroke cycle** runs from one hand entry to the next entry of the same hand.
+
+Save the wrist-height-over-time signal as an artifact. When something looks
+wrong, that plot is how the user diagnoses it.
+
+### 8.4 Lap splitting
+The client's definition for this POC: a lap is complete when the swimmer
+reaches the far wall and comes back.
+
+Detect a turn as the moment the swimmer's direction of travel reverses, using
+the smoothed centroid position in metres. Internally, compute metrics **per
+length** (one 25 m traverse), then also report them aggregated per lap. The
+CSV carries both.
+
+### 8.5 Metrics (`src/metrics.py`)
+
+Only count cycles whose entry and exit both fall inside the clean zone
+(default 5 m to 20 m of each length).
+
+```
+clean_swim_time   = time from entering 5 m to exiting 20 m
+average_speed     = clean distance / clean_swim_time          (m/s)
+cycle_count       = number of complete cycles in the clean zone
+stroke_rate       = cycle_count / clean_swim_time * 60        (cycles/min)
+distance_per_cycle = clean distance / cycle_count             (m)
+cycle_time_cv     = std(cycle times) / mean(cycle times) * 100
+```
+
+Position must be **continuous**, not quantised to grid strips. The strips are
+for drawing and for the user to verify by eye. The maths uses the exact metre
+position from the homography. Distance per cycle is around 1.8–2.5 m — if we
+rounded position to 2.5 m strips, the number would be meaningless.
+
+### 8.6 Quality gate
+Do not report a score when any of these is true:
+- Mean wrist confidence across the cycle is below `min_confidence`
+- Fewer than `min_valid_cycles` complete cycles in the clean zone
+- A hand entry or exit was occluded
+
+When the gate blocks a result, the CSV row still exists but the measurement
+columns are empty and a `rejection_reason` column explains why. Never guess.
+
+### 8.7 Benchmarks and scoring
+
+We do not have professional swimmer data. The numbers in `config.yaml` come
+from the client's specification document and are explicitly marked as initial
+placeholder ranges there.
+
+So:
+- Report all raw measurements.
+- Compare them against the placeholder ranges and show whether they fall
+  inside, below, or above.
+- **Mark every comparison as provisional** in the CSV and on the web page.
+- Do **not** produce the weighted 0–100 composite score. Two of its four
+  components cannot be computed: the speed component needs percentiles from a
+  matched professional group we do not have, and the technique component for
+  freestyle is not defined in the client's specification at all.
+
+Instead, output the components we *can* compute — stroke rate, distance per
+cycle, speed, cycle-time variation — each with its provisional comparison.
+Add a short note in the output explaining why the composite score is absent.
+This is an honest, defensible position and it tells the client exactly what
+data they need to supply next.
+
+### 8.9 Rendering (`src/render.py`)
+Produce an annotated video showing:
+- The measurement grid drawn in perspective over the pool
+- Each swimmer's bounding box, ID, and lane
+- The tracked wrist point
+- A marker flashing at each detected hand entry
+- Running counters: cycle count, current stroke rate, distance covered
+- A clear "PROVISIONAL" watermark on any benchmark comparison
+
+The grid is what lets the client confirm the distance maths with their own
+eyes. Make it clearly visible without hiding the swimmers.
+
+---
+
+## 9. Performance
+
+The POC is not real-time, but speed still matters because the user will run
+this many times while tuning.
+
+Requirements:
+- Batch frames through the GPU. Never process one frame at a time.
+- Use `half=True` on CUDA.
+- Run pose only on swimmers inside the pool area.
+- Cache detection and pose output to `cache/`. Changing an event threshold
+  must not require re-running the models. This is the single biggest time
+  saver during tuning.
+- Print a timing breakdown per stage at the end of every run.
+
+Report processing speed as frames per second in the summary and in MLflow.
+
+---
+
+## 10. MLflow
+
+Local file store at `./mlruns`. Start it with `mlflow ui` and view at
+`localhost:5000`.
+
+### Run names
+Format: `{video}__{what_changed}__{MMDD-HHMM}`
+
+```
+freestyle_lane3_25m__baseline__0918-1430
+freestyle_lane3_25m__wrist-thresh-0.5__0918-1455
+```
+
+Use `baseline` when nothing was deliberately changed. The name must let the
+user tell runs apart in a list without opening them.
+
+### Tags
+`video`, `stroke`, `stage` (full / detect-only / events-only), `model`,
+`git_commit`.
+
+### Parameters
+Every parameter name starts with the stage it belongs to.
+
+```
+video_name, video_fps, video_frames, video_duration_sec
+detect_model, detect_conf_threshold, detect_batch_size, detect_half_precision
+pose_model, pose_conf_threshold, pose_batch_size
+calib_pool_length_m, calib_segment_size_m, calib_lanes_count
+calib_clean_zone_start_m, calib_clean_zone_end_m
+event_wrist_threshold, event_min_cycle_sec, event_smoothing_window
+quality_min_confidence, quality_min_cycles
+```
+
+### Metrics
+```
+time_detect_sec, time_pose_sec, time_events_sec, time_total_sec, speed_fps
+quality_wrist_visible_pct, quality_mean_confidence, quality_rejected_events
+result_cycles_detected, result_stroke_rate_cpm, result_dpc_m, result_avg_speed_ms
+```
+
+### Artifacts
+Annotated video, results CSV, calibration JSON, calibration preview image,
+wrist-signal plot.
+
+### Naming rule
+Any new parameter or metric must use one of the prefixes above. Adding a new
+prefix requires recording it in `README.md` first. Lowercase with
+underscores, no spaces, no ambiguous abbreviations. This prevents `conf`,
+`confidence`, and `conf_thresh` all existing side by side after fifty runs.
+
+---
+
+## 11. Git
+
+Run `git init` inside the project. `.gitignore` must exclude:
+
+```
+data/raw/
+outputs/
+cache/
+mlruns/
+*.pt
+__pycache__/
+*.pyc
+.venv/
+```
+
+Commit at meaningful milestones, not once at the end. Suggested sequence:
+project skeleton → calibration tool → detection and tracking → pose →
+events → metrics → rendering → MLflow → web page.
+
+Commit messages in plain language: "Add calibration tool for pool corners and
+lane water lines", not "feat(calib): impl homography".
+
+---
+
+## 12. Video sourcing (`data/candidates.md`)
+
+Before writing pipeline code, search for suitable footage and write the
+candidates into `data/candidates.md` as a table for the user to approve.
+
+Required for each candidate:
+
+| Column | Notes |
+|---|---|
+| Link | Direct URL |
+| Source | Channel or site |
+| Duration | |
+| Camera angle | Describe it |
+| Camera fixed? | Yes / No / Slight movement |
+| Pool visible | How much of the length is in frame |
+| Lanes visible | |
+| Estimated fps | |
+| Why it fits | One line |
+
+What makes footage suitable:
+- The camera does **not** move, pan, or zoom
+- Most or all of the pool length is visible
+- Any side angle is acceptable as long as swimmers are clearly visible
+- Freestyle
+- Swimmers large enough in frame that a wrist is more than a few pixels
+
+What to avoid: broadcast competition coverage (the camera pans and the
+swimmers are tiny), underwater-only footage, heavily edited clips with cuts.
+
+Search terms that tend to work: "freestyle technique side view", "swim stroke
+analysis fixed camera", "swimming training session side angle", "GoPro
+swimming pool side view". Also check Roboflow Universe for existing swimmer
+detection datasets.
+
+Target **10 to 15 clips**, 20 to 60 seconds each.
+
+**Do not download anything.** Write the list. The user reviews it, picks the
+suitable ones, and places them in `data/raw/` themselves.
+
+---
+
+## 13. Manual review
+
+The user wants to be involved in the labelling and verification. Build tools
+that make their part fast — reviewing and correcting, never typing raw data.
+
+Provide a small review script that:
+- Plays back detected hand-entry moments one at a time
+- Lets the user press a key to accept or reject each one
+- Saves the accepted events as ground truth in a CSV
+
+This ground truth is used to **measure** accuracy, not to train. Target around
+200 events across 3 or 4 videos.
+
+---
+
+## 14. The web page (`app.py`)
+
+A single Gradio page. Deliberately minimal:
+- Upload a video, or pick one already in `data/raw/`
+- A button to run the analysis
+- Shows the annotated video and the results table when finished
+- Shows a provisional-data warning next to any benchmark comparison
+
+No login, no database, no styling work. It exists so the client can try the
+system themselves rather than watch a screen recording.
+
+---
+
+## 15. Success criteria
+
+The POC is accepted when, on at least 10 approved clips:
+- Detected cycle count is within ±1 of a manual count
+- Stroke rate is within ±5% of a manually calculated value
+- Distance per cycle falls in a physically sensible range and is consistent
+  across cycles by the same swimmer
+- The quality gate correctly rejects clips that are genuinely too poor to
+  measure, rather than producing confident nonsense
+
+Report these numbers honestly in the final summary, including the failures.
+
+---
+
+## 16. Known limitations to state in the output
+
+Write these into `README.md` and show them in the final summary. They are
+arguments for the production camera specification, not excuses.
+
+1. **Frame rate.** Internet footage is usually 25 or 30 fps. At 30 fps, timing
+   resolution is 33 milliseconds, which introduces roughly 3% error in stroke
+   rate. The client specification asks for 50–60 fps. This limit comes from
+   the source video, not from the model.
+
+2. **Resolution.** At 1080p covering 25 m, a hand is roughly 12–15 pixels
+   across. 4K would roughly double that.
+
+3. **Camera angle.** Footage found online will not match the production
+   camera position. Accuracy on production footage should be better, not
+   worse, but it must be re-measured once real footage exists.
+
+4. **Benchmarks.** All comparisons use placeholder ranges. Real benchmarks
+   require at least 20 professional swimmers per category (stroke, sex, age
+   band, distance, pool length, session type).
+
+---
+
+## 17. Build order
+
+Work through these in order. Stop and report at the end of each phase.
+
+1. Project skeleton, `config.yaml`, git init, MLflow wiring, `README.md`
+2. `data/candidates.md` — the video shortlist for the user to approve
+3. `calibrate.py` with the verification preview image
+4. `detect_track.py` with caching and lane assignment
+5. `pose.py` with the wrist-visibility check — **stop here and report the
+   percentage before continuing**
+6. `events.py` with the wrist-signal plot
+7. `metrics.py` and the quality gate
+8. `render.py`
+9. Manual review script
+10. `app.py`
+11. Accuracy measurement against ground truth, final summary
+
+---
+
+## 18. When to stop and ask
+
+Ask the user before:
+- Adding any file or folder not listed in section 4
+- Changing anything in section 3
+- Fine-tuning any model
+- Downloading any video
+- Adding a dependency not already in `requirements.txt`
+- Producing a composite score, or any number presented as if the benchmarks
+  were real
+
+If wrist visibility comes back below 70%, stop and report. Do not work around
+it silently.

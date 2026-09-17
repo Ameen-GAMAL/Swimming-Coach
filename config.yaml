@@ -1,0 +1,45 @@
+video:
+  fps_override: null          # Leave null to read fps from the file
+
+pool:
+  length_m: 25
+  lanes: 6
+  segment_size_m: 2.5         # Size of each grid strip drawn on the video
+  clean_zone_start_m: 5       # Skip the dive and the push-off
+  clean_zone_end_m: 20        # Skip the approach to the wall
+
+detection:
+  model: yolo11m.pt
+  conf_threshold: 0.35
+  batch_size: 16
+  half_precision: true
+
+pose:
+  model: yolo11m-pose.pt
+  conf_threshold: 0.30
+  batch_size: 16
+  half_precision: true
+
+events:
+  wrist_conf_threshold: 0.40
+  min_cycle_seconds: 0.6      # Anything faster than this is noise
+  smoothing_window: 5         # Frames, to steady the wrist signal
+
+quality:
+  min_confidence: 0.90
+  min_valid_cycles: 3
+
+benchmarks:
+  provisional: true           # These are placeholder numbers, not real data
+  freestyle:
+    stroke_rate_50m: [55, 70]   # cycles per minute
+    stroke_rate_100m: [45, 60]
+    distance_per_cycle: [1.8, 2.5]   # metres
+
+mlflow:
+  tracking_uri: "file:./mlruns"
+  experiment_name: "swimming-poc"
+
+cache:
+  enabled: true
+  directory: "./cache"
