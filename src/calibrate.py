@@ -121,6 +121,48 @@ def draw_lines(canvas, lines, color, label_prefix, scale=1.0):
     return canvas
 
 
+def prompt_span(pool_length_m):
+    # Retries on bad input instead of crashing, so a typo doesn't throw away
+    # the 4 corner clicks the user already made.
+    while True:
+        span = input(
+            f"\nHow much of the pool length do these 4 corners span, in metres?\n"
+            f"  - If they start at the near wall, just enter the length (e.g. 7)\n"
+            f"  - If they cover a shorter stretch that does NOT start at the wall, enter start,end (e.g. 5,20)\n"
+            f"  - Press enter for the default: the whole pool (0,{pool_length_m})\n> "
+        ).strip()
+        if not span:
+            return 0.0, float(pool_length_m)
+        try:
+            if "," in span:
+                start_m, end_m = (float(v) for v in span.split(","))
+            else:
+                start_m, end_m = 0.0, float(span)
+        except ValueError:
+            print(f"Could not read '{span}' as a number or a 'start,end' pair -- try again.")
+            continue
+        if end_m <= start_m:
+            print(f"End ({end_m}) must be greater than start ({start_m}) -- try again.")
+            continue
+        return start_m, end_m
+
+
+def prompt_int(question, default):
+    while True:
+        text = input(f"{question} [default {default}]: ").strip()
+        if not text:
+            return default
+        try:
+            value = int(text)
+        except ValueError:
+            print(f"Could not read '{text}' as a whole number -- try again.")
+            continue
+        if value < 1:
+            print("Must be at least 1 -- try again.")
+            continue
+        return value
+
+
 def calibrate_corners(display_frame, display_scale, config):
     pool_length_m = config["pool"]["length_m"]
     lane_width_m = config["pool"]["lane_width_m"]
@@ -132,14 +174,8 @@ def calibrate_corners(display_frame, display_scale, config):
             "Click the water surface corners: near-left, near-right, far-right, far-left",
         )
 
-        span = input(
-            f"\nHow much of the pool length (in metres) do these 4 corners span? "
-            f"Press enter for the default '0,{pool_length_m}' (the whole pool): "
-        ).strip()
-        start_m, end_m = (0.0, float(pool_length_m)) if not span else tuple(float(v) for v in span.split(","))
-
-        lanes_txt = input("How many lanes wide are these corners? [default 1]: ").strip()
-        lanes_spanned = int(lanes_txt) if lanes_txt else 1
+        start_m, end_m = prompt_span(pool_length_m)
+        lanes_spanned = prompt_int("How many lanes wide are these corners?", 1)
         width_m = lanes_spanned * lane_width_m
 
         H = compute_homography(corners, start_m, end_m, width_m)
@@ -229,8 +265,7 @@ def main():
     print(f"Calibrating {args.video} using frame {frame_number} ({w}x{h})")
     corners, H, span = calibrate_corners(display_frame, display_scale, config)
 
-    lanes_txt = input(f"How many lanes are visible in this frame? [default {config['pool']['lanes']}]: ").strip()
-    lanes_visible = int(lanes_txt) if lanes_txt else config["pool"]["lanes"]
+    lanes_visible = prompt_int("How many lanes are visible in this frame?", config["pool"]["lanes"])
 
     grid_frame = draw_length_grid(display_frame.copy(), H, config["pool"]["length_m"], config["pool"]["segment_size_m"], span[2], display_scale)
     water_lines = calibrate_water_lines(grid_frame, display_scale, lanes_visible)
