@@ -408,7 +408,14 @@ honestly, including the failures, per section 15:
   (median confidence ~0.13, documented in Phase 4), which the available
   footage's extreme camera angle and dataset (single-swimmer trials, not
   race conditions) makes worse, not something metrics.py or events.py
-  got wrong.
+  got wrong. **Confirmed on a second, independent clip** (`DIVE_P023`):
+  same "nothing to report" result, but via a different mechanism this
+  time — the two tracks long enough to analyse both fell in a stretch
+  late in the clip (44-54s into a 54s video) where camera-motion
+  estimation was never reliable, so every position came out as a gap
+  rather than a wrong number. Two different real clips failing for two
+  related-but-distinct reasons, both rooted in the same underlying
+  footage limitations, is a stronger signal than one clip failing once.
 - **Length-scale calibration accuracy varies by clip and is only
   approximate by construction**: 11% over on one clip, up to 60% over
   (after clamping; 85% raw) on another. There is no way to make this
