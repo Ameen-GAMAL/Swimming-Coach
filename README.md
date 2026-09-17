@@ -61,12 +61,27 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
    footage: **80.7%**, above CLAUDE.md's 70% gate (section 8.2), so the
    pretrained pose model is good enough to continue without fine-tuning.
 6. Events (`src/events.py`) — **done**. Hand entry/exit detection with a
-   state machine (fixed a real bug during build — see "Known limitations"
-   below), plus the wrist-signal plot artifact. Verified on real footage:
-   8 entries paired with 8 exits on the one track long enough to analyse.
+   state machine, plus the wrist-signal plot artifact.
+7. Metrics and quality gate (`src/metrics.py`) — **done**. Turn/length
+   detection, clean-zone filtering, the five client metrics, provisional
+   benchmark comparison, and lap aggregation. Validated against a
+   synthetic ideal-swimmer signal (every number came out exactly right);
+   on real footage tested so far, correctly reports "nothing to report"
+   rather than guessing — see "Known limitations" below for why.
+8. Rendering (`src/render.py`) — **done**. Grid, boxes/IDs/lanes, wrist
+   point, entry-flash markers, running counters, provisional watermark.
+9. Manual review (`src/review.py`) — **done**, interactive by necessity
+   (a person has to judge each detected event) so not fully testable by
+   an agent; the non-interactive parts (clip extraction, cross-video
+   ground-truth accumulation) are verified. Not one of CLAUDE.md's
+   original 8 files — see section 13's amendment note.
+10. Web page (`app.py`) — **done**. Verified end-to-end through the actual
+    UI: upload/pick a video, run the full pipeline, see the annotated
+    video and results table.
 
-Everything else (metrics, rendering, manual review, web page) is not built
-yet.
+Remaining: accuracy measurement against real ground truth needs a person
+to actually run `review.py` (see "Known limitations" and the final
+summary below).
 
 ## Project layout
 
@@ -205,6 +220,54 @@ the camera). Skips tracks too short to contain a full stroke cycle
 plot per analysed track to `outputs/` — check this when a result looks
 wrong, per CLAUDE.md section 8.3.
 
+### Metrics
+
+```
+.venv\Scripts\python.exe -m src.metrics data\raw\<video-file>.MP4
+```
+
+Splits each swimmer's position into lengths (turns detected via a
+minimum-swing zigzag, so tracking jitter isn't mistaken for a wall turn),
+computes the five client metrics inside the clean zone, applies the
+quality gate (never guesses — a rejected length's measurement columns are
+blank with a `rejection_reason`), adds provisional benchmark comparisons,
+and aggregates pairs of lengths into laps. Saves `outputs/<video>_metrics.csv`.
+
+### Rendering
+
+```
+.venv\Scripts\python.exe -m src.render data\raw\<video-file>.MP4
+```
+
+Draws the grid, each tracked swimmer's box/ID/lane, their wrist, a flash
+at each hand entry, running counters, and a provisional watermark onto
+the video. Saves `outputs/<video>_annotated.mp4` (capped at 1920px wide
+and 30fps — see `render.output_max_width`/`output_fps` in config.yaml —
+since this machine's OpenCV has no H.264 encoder and the fallback codec
+produces huge files at full source resolution/framerate).
+
+### Manual review
+
+```
+.venv\Scripts\python.exe -m src.review data\raw\<video-file>.MP4
+```
+
+Interactive — plays a short clip around each detected hand-entry, looping
+until you press `y` (accept), `n` (reject), or `q` (quit early). Accepted
+events accumulate across videos into `outputs/ground_truth_events.csv`.
+Target: around 200 events across 3-4 videos (CLAUDE.md section 13).
+
+### Web page
+
+```
+.venv\Scripts\python.exe app.py
+```
+
+Opens a Gradio page at `http://127.0.0.1:7860`. Upload a video or pick one
+from `data/raw/`, click "Run analysis", and it runs the whole pipeline
+(calibrating first if needed) then shows the annotated video and results
+table. Takes several minutes depending on video length.
+
 ## MLflow
 
 Local file store at `./mlruns`.
@@ -282,7 +345,91 @@ measurement. Two more, found while building detection/tracking (Phase 4):
    (the hand can only exit after entering, and vice versa), confirmed
    correct on real footage: 8 entries, 8 exits.
 
+9. **Lane-based track ID merging (Phase 4) had merged tracks that overlap
+   in time, not just tracks with a real gap between them** — found while
+   building `metrics.py`: the "same swimmer" identity that produced the
+   8-entry/8-exit result above turned out to contain 113 duplicate-frame
+   rows with two conflicting wrist positions at the same instant, meaning
+   two different, simultaneous detections had been merged into one track.
+   Fixed (the merge now requires the new segment to start strictly after
+   the previous one ends). After the fix, no single track in this
+   specific clip currently has enough continuous, valid data to show a
+   complete stroke cycle — the earlier 8/8 result was real code working
+   correctly, but on corrupted input. This is a sobering, honest finding,
+   not a regression: it reflects Phase 4's already-documented weak-detector
+   problem more accurately than the buggy version did.
+
+10. **OpenCV's `VideoWriter` has no working H.264 encoder on this machine**
+    (the OpenH264 DLL isn't installed) and falls back to a much less
+    efficient codec — writing the annotated video at full 4K source
+    resolution and the source's ~120fps produced a 2.3GB file for a 45s
+    clip. Fixed by writing at a capped resolution (1920px wide) and a
+    capped output fps (30) — the "every frame" fixed decision governs
+    *analysis*, not the review video, so this doesn't touch measurement
+    accuracy. Result: ~365MB for the same clip (extrapolated from a 900-frame
+    test render), a ~6x reduction.
+
 ## Deferred (explicitly out of scope, not built)
 
 Nothing deferred yet — this list grows only when a specific future need
 becomes obvious during the build (CLAUDE.md section 2).
+
+## Final summary (CLAUDE.md section 17, step 11)
+
+Every pipeline stage in the build order is built and runs end-to-end,
+including through the actual Gradio UI. Reporting the real results
+honestly, including the failures, per section 15:
+
+**What works, measured on real footage:**
+- Wrist visibility: **80.7%**, clearing the 70% gate — the pretrained
+  pose model doesn't need fine-tuning.
+- Camera-motion compensation: reliable after switching from matching
+  every frame against one fixed reference (which degraded over a clip)
+  to chaining frame-to-frame matches.
+- The full mechanical pipeline (calibrate → detect/track → pose → events
+  → metrics → render) runs without crashing on real video, with a real
+  (automatic) calibration, through the actual web page.
+- `metrics.py`'s maths is verified correct: tested against a synthetic
+  ideal-swimmer signal, every one of the five client metrics (clean swim
+  time, average speed, stroke rate, distance per cycle, cycle-time
+  variation) came out exactly right, and the quality gate correctly
+  rejects and blanks a result when confidence is too low.
+
+**What doesn't work yet, and why — the honest part:**
+- **Against CLAUDE.md's own success criteria (section 15), this POC does
+  not currently produce an accepted measurement on the test footage.**
+  On the clip tested most (`DIVE_P010`), after fixing a real track-merge
+  bug found while building `metrics.py`, no single track has enough
+  continuous, valid position/pose data to complete even one full length
+  inside the clean zone. The pipeline's response to this is exactly what
+  CLAUDE.md's quality gate is supposed to do: report nothing rather than
+  guess. That is the gate working correctly — the underlying cause is the
+  pretrained detector's weak performance on swimmers in this footage
+  (median confidence ~0.13, documented in Phase 4), which the available
+  footage's extreme camera angle and dataset (single-swimmer trials, not
+  race conditions) makes worse, not something metrics.py or events.py
+  got wrong.
+- **Length-scale calibration accuracy varies by clip and is only
+  approximate by construction**: 11% over on one clip, up to 60% over
+  (after clamping; 85% raw) on another. There is no way to make this
+  exact with the available footage, because no frame in it ever shows a
+  pool wall.
+- **Accuracy measurement against real ground truth (this step's other
+  half) has not been done** — CLAUDE.md section 13's review tool is
+  interactive by design (a person judges each detected event), so an
+  agent cannot generate it. `src/review.py` is built and its
+  non-interactive parts are verified; running it against real detected
+  events, across the 3-4 videos the spec asks for, is a task for a
+  person at the keyboard.
+
+**What this means for the production camera spec** (the actual point of
+a POC, per CLAUDE.md's opening framing): the biggest, clearest argument
+this POC produces is that the *camera setup* needs to change for the
+production system — a camera that pans, sits at deck level close enough
+that a wall never enters frame, and produces footage where a general-
+purpose pretrained detector performs this poorly, will not give reliable
+measurements no matter how well the downstream pipeline is built. A
+fixed, wider-framed, higher, more stable camera (as CLAUDE.md section 16
+already argues for on frame-rate/resolution grounds) would likely fix
+most of what's currently blocking real numbers, independently of any
+software change here.

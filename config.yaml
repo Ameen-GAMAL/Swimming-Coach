@@ -93,6 +93,14 @@ benchmarks:
     stroke_rate_100m: [45, 60]
     distance_per_cycle: [1.8, 2.5]   # metres
 
+render:
+  # OpenCV's VideoWriter on this machine has no working H.264 encoder
+  # (OpenH264 DLL missing) and falls back to a poorly-compressed codec --
+  # writing at full 4K source resolution produced a 2.3GB file for a 45s
+  # clip. Downscaling before writing is the reliable, dependency-free fix.
+  output_max_width: 1920
+  output_fps: 30               # the fixed "every frame" decision is about analysis, not the review video -- writing at the source's ~120fps produces a huge file for no visual benefit
+
 mlflow:
   tracking_uri: "file:./mlruns"
   experiment_name: "swimming-poc"

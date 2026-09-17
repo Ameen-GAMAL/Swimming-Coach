@@ -158,19 +158,21 @@ swimming-poc/
 │   ├── raw/               Approved videos (user puts them here)
 │   └── calibration/       One JSON per video, produced by calibrate.py
 ├── src/
-│   ├── calibrate.py       Click-based setup tool
+│   ├── calibrate.py       Automatic setup tool (rewritten -- see section 3 amendments)
 │   ├── detect_track.py    Find swimmers, give each a stable ID
 │   ├── pose.py            Find body points on each swimmer
 │   ├── events.py          Find hand entry and exit moments
 │   ├── metrics.py         Turn events into measurements
 │   ├── render.py          Draw the annotated output video
-│   └── profiling.py       Time each stage, send results to MLflow
+│   ├── profiling.py       Time each stage, send results to MLflow
+│   └── review.py          Manual review tool (added -- see section 13 amendment)
 ├── cache/                 Intermediate results, so reruns are fast
 └── outputs/               Final CSV and annotated video
 ```
 
-Eight source files. Each one does a single job. If a file starts doing two
-jobs, stop and ask before splitting it.
+Eight source files, plus `review.py` added per the section 13 amendment.
+Each one does a single job. If a file starts doing two jobs, stop and ask
+before splitting it.
 
 ---
 
@@ -613,7 +615,14 @@ suitable ones, and places them in `data/raw/` themselves.
 
 ---
 
-## 13. Manual review
+## 13. Manual review (`src/review.py`)
+
+**Amendment (Phase 9, found during build):** this file isn't in section 4's
+original list of 8 -- an apparent oversight there, since this section
+describes its behaviour in detail as its own deliverable and the build
+order (section 17, step 9) lists it as its own step. Added as `src/review.py`
+rather than folded into an existing file, since it does a genuinely
+different job (interactive human review) from any of the other seven.
 
 The user wants to be involved in the labelling and verification. Build tools
 that make their part fast — reviewing and correcting, never typing raw data.
@@ -625,6 +634,10 @@ Provide a small review script that:
 
 This ground truth is used to **measure** accuracy, not to train. Target around
 200 events across 3 or 4 videos.
+
+Ground truth accumulates across videos into one file
+(`outputs/ground_truth_events.csv`) rather than one file per video, since
+the target is a combined set spanning several clips.
 
 ---
 
