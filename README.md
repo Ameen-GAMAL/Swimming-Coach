@@ -23,9 +23,12 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
    run correctly end-to-end on real footage; full accuracy validation is
    still pending a real calibration (see "Known limitations" below for two
    real findings from this stage).
+5. Pose (`src/pose.py`) — **done**. Measured wrist visibility on real
+   footage: **80.7%**, above CLAUDE.md's 70% gate (section 8.2), so the
+   pretrained pose model is good enough to continue without fine-tuning.
 
-Everything else (pose, events, metrics, rendering, manual review, web page)
-is not built yet.
+Everything else (events, metrics, rendering, manual review, web page) is
+not built yet.
 
 ## Requirements
 
@@ -90,6 +93,23 @@ area, assigns each track to a lane, and merges track IDs that reappear in
 the same lane shortly after a gap. Result is cached to `cache/detect_track/`
 keyed on video, model, and confidence threshold — rerunning with the same
 settings reuses the cache instantly.
+
+### Pose
+
+Requires detection and tracking to have run for the video first (runs it
+automatically via the cache if not).
+
+```
+.venv\Scripts\python.exe -m src.pose data\raw\<video-file>.MP4
+```
+
+Runs YOLO11-pose on a crop around each tracked swimmer, applies the same
+camera-motion correction, and reports `quality_wrist_visible_pct` — the
+percentage of processed frames with a wrist visible above
+`pose.conf_threshold`. Below 70%, stop: the pretrained model isn't reliable
+enough and needs a decision from the user (CLAUDE.md section 8.2's
+fallback is annotating 300–500 frames and fine-tuning). Measured on real
+footage so far: **80.7%**.
 
 ## MLflow
 

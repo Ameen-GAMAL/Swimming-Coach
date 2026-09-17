@@ -256,6 +256,11 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
             filtered = boxes[keep]
             tracks = tracker.update(filtered, img=frame)
 
+            # Flattened so pose.py can rebuild this frame's raw-pixel ->
+            # reference-frame transform for its own keypoints, without
+            # redoing the background feature matching itself.
+            m_flat = M.flatten() if motion_ok else [np.nan] * 9
+
             for row in tracks:
                 x1, y1, x2, y2, track_id, score, cls, idx = row
                 kept_indices = np.where(keep)[0]
@@ -272,6 +277,9 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
                     "x_m": x_m, "y_m": y_m,
                     "score": float(score),
                     "camera_motion_good_features": good_features,
+                    "m00": m_flat[0], "m01": m_flat[1], "m02": m_flat[2],
+                    "m10": m_flat[3], "m11": m_flat[4], "m12": m_flat[5],
+                    "m20": m_flat[6], "m21": m_flat[7], "m22": m_flat[8],
                 })
             frame_idx += 1
 
