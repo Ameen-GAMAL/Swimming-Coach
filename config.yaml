@@ -10,9 +10,28 @@ pool:
   clean_zone_end_m: 20        # Skip the approach to the wall
 
 calibration:
-  display_max_width: 1600     # calibration window is shown scaled to this width so it fits on screen
+  # Automatic calibration (no clicking -- see CLAUDE.md section 3 amendment).
+  # Water-colour thresholds (HSV) for finding the pool; tune these if the
+  # water mask misses the pool or picks up sky/buildings in different footage.
+  water_hue_min: 75
+  water_hue_max: 100
+  water_sat_min: 60
+  water_value_min: 180
+  water_search_top_frac: 0.45     # ignore this top fraction of the frame -- pool is always lower, this avoids blue building trim
+  lane_far_edge_gap_fraction: 1.0 # the lane's far edge is approximated as this fraction of the remaining gap to the frame's bottom edge, since only one rope is reliably detectable
 
-pool_area_margin_m: 1.5       # allowed slack around the calibrated pool area before a detection is discarded as outside the pool
+  # Length-scale estimate from the swimmer's own body size (no wall visible
+  # in this footage -- see CLAUDE.md section 3 amendment). Sampled and
+  # filtered heavily because the pretrained detector/pose model are both
+  # unreliable on this footage, and a handful of bad keypoint reads can
+  # throw the whole estimate off by several times if not filtered out.
+  scale_estimate_num_samples: 250     # frames spread across the video to attempt
+  scale_estimate_min_keypoint_conf: 0.30  # matches pose.conf_threshold -- the pixel-sanity floor below is what actually catches bad keypoint reads here, not confidence (a bad reading can still score high confidence)
+  scale_estimate_min_torso_px: 40     # below this, a shoulder/hip reading is almost certainly a bad keypoint, not a real torso
+  scale_estimate_min_samples: 6        # fail loudly rather than trust a scale built from a handful of samples
+  length_scale_clamp_ratio: [0.7, 1.6]  # the anthropometric estimate is clamped to this multiple of pool.length_m -- the true length is a known constant, so it's used as a prior against a noisy measurement rather than trusting the measurement unconditionally
+
+pool_area_margin_m: 3.0       # allowed slack around the calibrated pool area before a detection is discarded as outside the pool -- generous because the automatic calibration's lane-width edge is itself a heuristic (see CLAUDE.md section 3 amendment), not a click-verified boundary
 
 tracking:
   # ByteTrack settings (matches the fixed decision: Tracker = ByteTrack).

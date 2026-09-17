@@ -16,13 +16,13 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
    the camera pans/tracks the swimmer rather than staying fixed; recorded
    an approved amendment in CLAUDE.md section 3 to compensate for this in
    `detect_track.py` (not built yet).
-3. Calibration tool (`src/calibrate.py`) — **done**, needs to be run by a
-   person (it's click-based) to actually calibrate a chosen video.
+3. Calibration tool (`src/calibrate.py`) — **done, fully automatic** (no
+   clicking — rebuilt this way after the manual version's length-scale
+   input proved unreliable with no wall ever visible in this footage; see
+   CLAUDE.md section 3 amendments). Just run it on a video.
 4. Detection and tracking (`src/detect_track.py`) — **done**, including
-   camera-motion compensation and lane-based track ID merging. Verified to
-   run correctly end-to-end on real footage; full accuracy validation is
-   still pending a real calibration (see "Known limitations" below for two
-   real findings from this stage).
+   camera-motion compensation and lane-based track ID merging. Verified
+   end-to-end on real footage with a real (automatic) calibration.
 5. Pose (`src/pose.py`) — **done**. Measured wrist visibility on real
    footage: **80.7%**, above CLAUDE.md's 70% gate (section 8.2), so the
    pretrained pose model is good enough to continue without fine-tuning.
@@ -58,29 +58,29 @@ each finished stage directly.
 
 ### Calibration
 
-Run as a module (not a plain script path) so `src.profiling` resolves
-correctly, the same as the other stages below:
+Fully automatic — supply a video, nothing else:
 
 ```
 .venv\Scripts\python.exe -m src.calibrate data\raw\<video-file>.MP4
 ```
 
-Opens one frame in a window. Click through three steps:
+What it does, with no interaction required:
+1. Finds the pool by water colour, and finds the one lane rope this method
+   can reliably detect (the boundary between open water and the rope
+   floats).
+2. Builds the 4 calibration corners from that rope; the lane's other edge
+   and its water line/boundary are derived from it too (see CLAUDE.md
+   section 7 for why a second rope isn't independently detected).
+3. Estimates the length-axis scale from the swimmer's own body size via
+   pose, since no wall or other known-distance landmark is ever visible in
+   this footage — this is an approximate, provisional estimate, not a
+   measurement (see "Known limitations" below).
 
-1. **4 pool corners** (near-left, near-right, far-right, far-left of the
-   visible water surface). You'll be asked in the terminal how much of the
-   pool length (in metres) those corners span — press enter to accept the
-   default (the whole pool), or type e.g. `5,20` if only a shorter, known
-   segment is visible. Then how many lanes wide the corners are (default 1).
-   A grid is drawn back over the frame immediately — press `y` to accept it
-   or `r` to redo the clicks if the grid doesn't follow the pool edges.
-2. **Water line per lane** — 2 clicks per lane, near edge to far edge.
-3. **Lane boundaries** — 2 clicks per boundary line (lanes + 1 of them).
-
-`u` undoes the last click at any point, `q` cancels. Output: a JSON file
-and a `_preview.png` in `data/calibration/`, named after the video — look
-at the preview image and confirm the grid, water lines, and lane boundaries
-actually follow the pool before trusting the calibration.
+Takes a few minutes (it runs detection and pose across 250 sampled frames
+to get a robust body-size estimate). Output: a JSON file and a
+`_preview.png` in `data/calibration/`, named after the video. Still worth
+glancing at the preview — the grid should roughly follow the pool/rope,
+even though the exact metre labels are approximate.
 
 ### Detection and tracking
 
@@ -169,6 +169,20 @@ measurement. Two more, found while building detection/tracking (Phase 4):
    over a 45s clip when tried this way. Fixed by chaining frame-to-frame
    matches instead (each frame matched against the previous one), which
    keeps overlap consistently high regardless of total pan.
+
+7. **No frame in this footage ever shows a pool wall**, confirmed across a
+   full clip and 4 other candidate clips (Phase 3). The manual click-based
+   calibration this originally called for couldn't work reliably as a
+   result — any length-span number a person typed was a guess, amplified
+   ~10x by extrapolation across the full 25m pool. Replaced with fully
+   automatic calibration (see "Calibration" above), whose length scale is
+   an approximate anthropometric estimate. Measured accuracy varies by
+   clip: 27.7m vs the true 25m for one clip (11% over), 46.2m raw (clamped
+   to 40m, 60% over) for another. Every calibration and everything computed
+   from it carries a `scale_method: approximate_anthropometric` flag —
+   distance and speed numbers from this POC should be read as
+   directionally useful, not as precise measurements, until real footage
+   with a visible wall (or another true landmark) is available.
 
 ## Deferred (explicitly out of scope, not built)
 

@@ -1,6 +1,18 @@
-# Click-based calibration tool. Produces one JSON file per video describing
-# the pool corners (as a homography), each lane's water line, and the lane
-# boundaries -- plus one preview image so the result can be checked by eye.
+# Automatically calibrates a video: finds the pool water, the lane rope
+# nearest the swimmer, the water line, and the lane boundary -- all from the
+# footage itself, no clicking. Produces the same JSON schema the manual tool
+# used to, plus a preview image, so detect_track.py and pose.py don't need
+# to change.
+#
+# No frame in this camera's footage ever shows a pool wall or another
+# landmark with a precisely known real-world distance along the swim
+# direction (see CLAUDE.md section 3 amendment). Lane WIDTH is still exact
+# -- 2.5m, FINA standard -- but lane LENGTH scale has no real landmark
+# available, so it is estimated approximately from the swimmer's own
+# detected torso length via pose, against an assumed average adult value.
+# Every calibration this produces is marked "scale_method":
+# "approximate_anthropometric" for that reason -- it is a provisional
+# estimate, not a measurement.
 
 import argparse
 import json
@@ -8,14 +20,16 @@ import os
 
 import cv2
 import numpy as np
+from ultralytics import YOLO
 
 from src.profiling import load_config
 
+ASSUMED_TORSO_LENGTH_M = 0.48  # average adult shoulder-midpoint-to-hip-midpoint length
+LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP = 5, 6, 11, 12
+
 
 def read_calibration_frame(video_path):
-    # A few seconds in, so the dive splash has settled and the swimmer is
-    # visible mid-stroke -- useful visual context for clicking, even though
-    # only static pool features (never the swimmer) get clicked.
+    # A few seconds in, so the dive splash has settled
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -30,48 +44,77 @@ def read_calibration_frame(video_path):
     return frame, frame_number
 
 
-def collect_points(window_name, base_frame, display_scale, num_points, instructions):
-    """Lets the user click num_points on base_frame (already scaled for
-    display). Returns the points in ORIGINAL, full-resolution pixel
-    coordinates. 'u' undoes the last click, enter confirms once all points
-    are placed, 'q' cancels the whole tool."""
-    points = []
+def detect_water_mask(frame, config):
+    # Pool water is a strongly saturated turquoise, distinct in hue from sky
+    # and in brightness from the blue-painted building elements above it.
+    # Restricted to the lower part of the frame -- where the pool always is
+    # in this camera's framing -- so blue building trim never gets confused
+    # for water even when its hue overlaps.
+    c = config["calibration"]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower = np.array([c["water_hue_min"], c["water_sat_min"], c["water_value_min"]])
+    upper = np.array([c["water_hue_max"], 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    mask[: int(frame.shape[0] * c["water_search_top_frac"]), :] = 0
 
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(points) < num_points:
-            points.append((x / display_scale, y / display_scale))
+    kernel = np.ones((25, 25), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
 
-    cv2.namedWindow(window_name)
-    cv2.setMouseCallback(window_name, on_mouse)
 
-    try:
-        while True:
-            canvas = base_frame.copy()
-            cv2.putText(canvas, instructions, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(canvas, f"{len(points)}/{num_points} points  |  u = undo, enter = confirm, q = quit",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            for i, (px, py) in enumerate(points):
-                dx, dy = int(px * display_scale), int(py * display_scale)
-                cv2.circle(canvas, (dx, dy), 6, (0, 0, 255), -1)
-                cv2.putText(canvas, str(i + 1), (dx + 8, dy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+def fit_rope_line(water_mask):
+    """Finds the topmost water pixel in every column -- tracing the
+    boundary between open water and the lane rope floats sitting on the
+    surface, i.e. the nearest lane rope itself -- and fits a straight line
+    to it. Returns (slope, intercept, min_x, max_x)."""
+    h, w = water_mask.shape
+    boundary_y = np.full(w, -1, dtype=np.int32)
+    for x in range(w):
+        col = np.nonzero(water_mask[:, x])[0]
+        if len(col) > 0:
+            boundary_y[x] = col[0]
 
-            cv2.imshow(window_name, canvas)
-            key = cv2.waitKey(20) & 0xFF
+    valid_x = np.nonzero(boundary_y >= 0)[0]
+    if len(valid_x) < w * 0.5:
+        raise RuntimeError(
+            "Could not find the pool water in this frame (water mask too small/empty). "
+            "The colour thresholds in config.yaml's calibration section may need adjusting for this footage."
+        )
 
-            if key == ord('u') and points:
-                points.pop()
-            elif key == ord('q'):
-                raise SystemExit("Calibration cancelled by user.")
-            elif key in (13, 10) and len(points) == num_points:
-                return points
-    finally:
-        cv2.destroyWindow(window_name)
+    ys = boundary_y[valid_x]
+    A = np.vstack([valid_x, np.ones_like(valid_x)]).T
+    slope, intercept = np.linalg.lstsq(A, ys, rcond=None)[0]
+    return float(slope), float(intercept), int(valid_x.min()), int(valid_x.max())
+
+
+def rope_corners(slope, intercept, min_x, max_x, frame_shape, config):
+    """Builds the 4 calibration corners from the one detected rope line.
+    near/far come from sampling the rope near its two ends (5th/95th
+    percentile of where it was confidently detected, to avoid edge noise).
+    The lane's far side (2.5m across, no second rope detected) is
+    approximated as a fraction of the remaining gap to the bottom of the
+    frame, which shrinks with distance the same way real perspective
+    foreshortening would -- see the module docstring for why this is a
+    heuristic, not a measurement."""
+    span = max_x - min_x
+    near_x = min_x + span * 0.05
+    far_x = min_x + span * 0.95
+    near_y = slope * near_x + intercept
+    far_y = slope * far_x + intercept
+
+    frac = config["calibration"]["lane_far_edge_gap_fraction"]
+    frame_h = frame_shape[0]
+    near_y2 = near_y + frac * (frame_h - near_y)
+    far_y2 = far_y + frac * (frame_h - far_y)
+
+    # Order: near-left, near-right, far-right, far-left
+    return [(near_x, near_y), (near_x, near_y2), (far_x, far_y2), (far_x, far_y)]
 
 
 def compute_homography(corners_px, start_m, end_m, width_m):
-    # Corner click order is fixed: near-left, near-right, far-right, far-left.
-    # Real-world axes: x = across the lanes (0 at the left edge clicked),
-    # y = along the pool (start_m at the near edge clicked, end_m at the far edge).
+    # Corner order: near-left, near-right, far-right, far-left.
+    # Real-world axes: x = across the lane, y = along the pool.
     real_points = np.array([
         [0.0, start_m],
         [width_m, start_m],
@@ -81,25 +124,112 @@ def compute_homography(corners_px, start_m, end_m, width_m):
     px_points = np.array(corners_px, dtype=np.float32)
     H, _ = cv2.findHomography(px_points, real_points)
     if H is None:
-        raise RuntimeError("Could not compute a homography from these 4 points -- they may be collinear.")
+        raise RuntimeError("Could not compute a homography from the detected corners -- they may be collinear.")
     return H
 
 
 def project_point(H_inv, x_m, y_m):
-    # Maps a real-world metre position back to a pixel position, for drawing
     point = np.array([x_m, y_m, 1.0])
     mapped = H_inv @ point
     mapped /= mapped[2]
     return mapped[0], mapped[1]
 
 
+def sample_swimmer_boxes(video_path, model, config):
+    """Runs detection on frames spread across the video to see where the
+    swimmer actually is, and to collect crops for the pose-based scale
+    estimate. Samples many frames because the pretrained detector and pose
+    model are both unreliable on this footage (see the Phase 4/5 findings)
+    -- most samples get discarded by estimate_length_scale's sanity checks,
+    so a small sample count leaves too few, too noisy survivors."""
+    cap = cv2.VideoCapture(video_path)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    conf = config["detection"]["conf_threshold"]
+    num_samples = config["calibration"]["scale_estimate_num_samples"]
+
+    samples = []
+    for frame_num in np.linspace(0, frame_count - 1, num_samples, dtype=int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_num))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        result = model.predict(frame, classes=[0], conf=conf, device=0, half=config["detection"]["half_precision"],
+                                verbose=False)[0]
+        boxes = result.boxes.cpu().numpy()
+        if len(boxes) == 0:
+            continue
+        best = int(np.argmax(boxes.conf))
+        samples.append((int(frame_num), frame, boxes.xyxy[best]))
+    cap.release()
+    return samples
+
+
+def estimate_length_scale(samples, pose_model, config, H_placeholder):
+    """Estimates the correction factor that turns the placeholder length
+    scale used to build H_placeholder into an approximate real one, from
+    the swimmer's own torso length (shoulder midpoint to hip midpoint).
+
+    Uses a HIGHER keypoint confidence than pose.conf_threshold and a
+    minimum pixel-length sanity floor, because this single number scales
+    every downstream distance/speed measurement -- a handful of garbage
+    keypoint reads (e.g. shoulder and hip nearly coincident, a few pixels
+    apart) sneak past the general confidence threshold and, left in, throw
+    the whole estimate off by several times. A trimmed median (middle 60%)
+    over many samples is used rather than a plain median over few, since
+    even after filtering some noise gets through.
+    """
+    cal_cfg = config["calibration"]
+    conf_threshold = cal_cfg["scale_estimate_min_keypoint_conf"]
+    min_torso_px = cal_cfg["scale_estimate_min_torso_px"]
+    ratios = []
+
+    for frame_num, frame, box in samples:
+        x1, y1, x2, y2 = box
+        pad_x, pad_y = (x2 - x1) * 0.25, (y2 - y1) * 0.25
+        h, w = frame.shape[:2]
+        cx1, cy1 = max(0, int(x1 - pad_x)), max(0, int(y1 - pad_y))
+        cx2, cy2 = min(w, int(x2 + pad_x)), min(h, int(y2 + pad_y))
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            continue
+
+        result = pose_model.predict(crop, conf=config["pose"]["conf_threshold"], device=0,
+                                     half=config["pose"]["half_precision"], verbose=False)[0]
+        kpts = result.keypoints.cpu().numpy() if result.keypoints is not None else None
+        if kpts is None or kpts.xy.shape[0] == 0:
+            continue
+        xy, confs = kpts.xy[0], kpts.conf[0] if kpts.conf is not None else np.zeros(17)
+        needed = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
+        if any(confs[i] < conf_threshold for i in needed):
+            continue
+
+        shoulder_mid = ((xy[LEFT_SHOULDER] + xy[RIGHT_SHOULDER]) / 2) + [cx1, cy1]
+        hip_mid = ((xy[LEFT_HIP] + xy[RIGHT_HIP]) / 2) + [cx1, cy1]
+        torso_px = np.hypot(*(shoulder_mid - hip_mid))
+        if torso_px < min_torso_px:
+            continue  # implausibly short for a real torso -- a bad keypoint read
+
+        s_placeholder = project_point(H_placeholder, *shoulder_mid)
+        h_placeholder = project_point(H_placeholder, *hip_mid)
+        torso_placeholder_units = np.hypot(s_placeholder[0] - h_placeholder[0], s_placeholder[1] - h_placeholder[1])
+        if torso_placeholder_units > 1e-6:
+            ratios.append(ASSUMED_TORSO_LENGTH_M / torso_placeholder_units)
+
+    if len(ratios) < cal_cfg["scale_estimate_min_samples"]:
+        return None, len(ratios)
+
+    ratios.sort()
+    trim = int(len(ratios) * 0.2)
+    trimmed = ratios[trim: len(ratios) - trim] if trim else ratios
+    return float(np.median(trimmed)), len(ratios)
+
+
 def draw_length_grid(canvas, H, pool_length_m, segment_size_m, width_m, scale=1.0):
-    # Draws a line every segment_size_m along the pool's length. Extends
-    # across the FULL pool_length_m even if only part of it was clicked --
-    # a homography is a valid mapping for the whole plane, not just the
-    # clicked rectangle, so this doubles as a sanity check: if these lines
-    # drift away from the real pool edges near the far end, the calibration
-    # or the length span entered was wrong.
+    # Draws a line every segment_size_m along the pool's length, across the
+    # FULL pool_length_m even though only a short stretch was ever detected
+    # -- a homography is a valid mapping for the whole plane, so this
+    # doubles as a sanity check: if these lines drift off the real pool
+    # edges near the far end, the calibration was wrong.
     H_inv = np.linalg.inv(H)
     for length_m in np.arange(0, pool_length_m + 1e-6, segment_size_m):
         x1, y1 = project_point(H_inv, 0.0, length_m)
@@ -121,102 +251,8 @@ def draw_lines(canvas, lines, color, label_prefix, scale=1.0):
     return canvas
 
 
-def prompt_span(pool_length_m):
-    # Retries on bad input instead of crashing, so a typo doesn't throw away
-    # the 4 corner clicks the user already made.
-    while True:
-        span = input(
-            f"\nHow much of the pool length do these 4 corners span, in metres?\n"
-            f"  - If they start at the near wall, just enter the length (e.g. 7)\n"
-            f"  - If they cover a shorter stretch that does NOT start at the wall, enter start,end (e.g. 5,20)\n"
-            f"  - Press enter for the default: the whole pool (0,{pool_length_m})\n> "
-        ).strip()
-        if not span:
-            return 0.0, float(pool_length_m)
-        try:
-            if "," in span:
-                start_m, end_m = (float(v) for v in span.split(","))
-            else:
-                start_m, end_m = 0.0, float(span)
-        except ValueError:
-            print(f"Could not read '{span}' as a number or a 'start,end' pair -- try again.")
-            continue
-        if end_m <= start_m:
-            print(f"End ({end_m}) must be greater than start ({start_m}) -- try again.")
-            continue
-        return start_m, end_m
-
-
-def prompt_int(question, default):
-    while True:
-        text = input(f"{question} [default {default}]: ").strip()
-        if not text:
-            return default
-        try:
-            value = int(text)
-        except ValueError:
-            print(f"Could not read '{text}' as a whole number -- try again.")
-            continue
-        if value < 1:
-            print("Must be at least 1 -- try again.")
-            continue
-        return value
-
-
-def calibrate_corners(display_frame, display_scale, config):
-    pool_length_m = config["pool"]["length_m"]
-    lane_width_m = config["pool"]["lane_width_m"]
-    window = "Step 1: click 4 corners (near-left, near-right, far-right, far-left)"
-
-    while True:
-        corners = collect_points(
-            window, display_frame, display_scale, 4,
-            "Click the water surface corners: near-left, near-right, far-right, far-left",
-        )
-
-        start_m, end_m = prompt_span(pool_length_m)
-        lanes_spanned = prompt_int("How many lanes wide are these corners?", 1)
-        width_m = lanes_spanned * lane_width_m
-
-        H = compute_homography(corners, start_m, end_m, width_m)
-
-        preview = draw_length_grid(display_frame.copy(), H, pool_length_m, config["pool"]["segment_size_m"], width_m, display_scale)
-        cv2.putText(preview, "Does the grid follow the pool edges? y = accept, r = redo", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.imshow(window, preview)
-        key = cv2.waitKey(0) & 0xFF
-        cv2.destroyWindow(window)
-        if key == ord('y'):
-            return corners, H, (start_m, end_m, width_m)
-        # anything else (default 'r') -- loop back and redo the clicks
-
-
-def calibrate_water_lines(base_frame, display_scale, lanes_visible):
-    lines = []
-    for lane_num in range(1, lanes_visible + 1):
-        pts = collect_points(
-            f"Step 2: lane {lane_num} water line ({lane_num}/{lanes_visible})",
-            base_frame, display_scale, 2,
-            f"Click 2 points along lane {lane_num}'s water line, near edge to far edge",
-        )
-        lines.append({"lane": lane_num, "points": pts})
-    return lines
-
-
-def calibrate_lane_boundaries(base_frame, display_scale, lanes_visible):
-    boundaries = []
-    total = lanes_visible + 1
-    for b in range(total):
-        pts = collect_points(
-            f"Step 3: boundary {b + 1} of {total}",
-            base_frame, display_scale, 2,
-            f"Click 2 points along lane boundary {b + 1} (left edge of the visible lanes if b=1)",
-        )
-        boundaries.append({"boundary_index": b, "points": pts})
-    return boundaries
-
-
-def save_calibration(video_path, frame_number, corners, H, span, water_lines, boundaries, config, out_dir="data/calibration"):
+def save_calibration(video_path, frame_number, corners, H, span, water_lines, boundaries, config,
+                      scale_samples, scale_was_clamped, out_dir="data/calibration"):
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(video_path))[0]
     out_path = os.path.join(out_dir, f"{stem}.json")
@@ -230,6 +266,9 @@ def save_calibration(video_path, frame_number, corners, H, span, water_lines, bo
         "homography": H.tolist(),
         "water_lines": water_lines,
         "lane_boundaries": boundaries,
+        "scale_method": "approximate_anthropometric",
+        "scale_estimate_frames_used": scale_samples,
+        "scale_estimate_clamped_to_prior": scale_was_clamped,
     }
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -241,6 +280,8 @@ def save_preview_image(frame, H, config, span, water_lines, boundaries, video_pa
     canvas = draw_length_grid(frame.copy(), H, config["pool"]["length_m"], config["pool"]["segment_size_m"], width_m)
     canvas = draw_lines(canvas, water_lines, (255, 0, 0), "lane")
     canvas = draw_lines(canvas, boundaries, (0, 0, 255), "boundary")
+    cv2.putText(canvas, "PROVISIONAL LENGTH SCALE (approximate, no wall visible in this footage)",
+                (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(video_path))[0]
@@ -249,38 +290,74 @@ def save_preview_image(frame, H, config, span, water_lines, boundaries, video_pa
     return out_path
 
 
+def calibrate_video(video_path, config, calibration_dir="data/calibration"):
+    frame, frame_number = read_calibration_frame(video_path)
+    pool_length_m = config["pool"]["length_m"]
+    lane_width_m = config["pool"]["lane_width_m"]
+
+    water_mask = detect_water_mask(frame, config)
+    slope, intercept, min_x, max_x = fit_rope_line(water_mask)
+    corners = rope_corners(slope, intercept, min_x, max_x, frame.shape, config)
+
+    # Placeholder length scale (0 to pool_length_m over the detected rope's
+    # own pixel span) just to get the homography's correct PERSPECTIVE
+    # SHAPE -- the length axis gets corrected below using the swimmer's own
+    # body size, since no real landmark is visible to calibrate it directly.
+    H_placeholder = compute_homography(corners, 0.0, pool_length_m, lane_width_m)
+
+    detect_model = YOLO(config["detection"]["model"])
+    pose_model = YOLO(config["pose"]["model"])
+    samples = sample_swimmer_boxes(video_path, detect_model, config)
+    correction, scale_samples = estimate_length_scale(samples, pose_model, config, H_placeholder)
+    if correction is None:
+        raise RuntimeError(
+            f"Could not estimate a length scale -- only {scale_samples} frame(s) had a confident enough, "
+            f"plausible-looking torso reading (need at least {config['calibration']['scale_estimate_min_samples']}). "
+            f"Try a video where the swimmer is more clearly visible, or lower calibration.scale_estimate_min_keypoint_conf "
+            f"in config.yaml."
+        )
+
+    # The raw anthropometric estimate can be wildly off (a handful of
+    # samples measured 3x too long on one clip during testing) -- but the
+    # pool's true length is a known, fixed constant (25m), so that knowledge
+    # is used as a strong prior and the noisy measurement is clamped to a
+    # plausible range around it, rather than trusted unconditionally.
+    clamp_min, clamp_max = config["calibration"]["length_scale_clamp_ratio"]
+    clamped_correction = float(np.clip(correction, clamp_min, clamp_max))
+    was_clamped = abs(clamped_correction - correction) > 1e-9
+
+    start_m, end_m = 0.0, pool_length_m * clamped_correction
+    H = compute_homography(corners, start_m, end_m, lane_width_m)
+
+    water_lines = [{"lane": 1, "points": [corners[0], corners[3]]}]
+    boundaries = [
+        {"boundary_index": 0, "points": [corners[0], corners[3]]},
+        {"boundary_index": 1, "points": [corners[1], corners[2]]},
+    ]
+    span = (start_m, end_m, lane_width_m)
+
+    json_path = save_calibration(video_path, frame_number, corners, H, span, water_lines, boundaries, config,
+                                  scale_samples, was_clamped, calibration_dir)
+    preview_path = save_preview_image(frame, H, config, span, water_lines, boundaries, video_path, calibration_dir)
+    return json_path, preview_path, scale_samples
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Calibrate a video: pool corners, water lines, lane boundaries.")
-    parser.add_argument("video", help="Path to the video to calibrate, e.g. data/raw/xyz.MP4")
+    parser = argparse.ArgumentParser(description="Automatically calibrate a video (no clicking required).")
+    parser.add_argument("video", help="Path to the video, e.g. data/raw/xyz.MP4")
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    frame, frame_number = read_calibration_frame(args.video)
-
-    h, w = frame.shape[:2]
-    display_scale = min(1.0, config["calibration"]["display_max_width"] / w)
-    display_frame = cv2.resize(frame, (int(w * display_scale), int(h * display_scale)))
-
-    print(f"Calibrating {args.video} using frame {frame_number} ({w}x{h})")
-    corners, H, span = calibrate_corners(display_frame, display_scale, config)
-
-    lanes_visible = prompt_int("How many lanes are visible in this frame?", config["pool"]["lanes"])
-
-    grid_frame = draw_length_grid(display_frame.copy(), H, config["pool"]["length_m"], config["pool"]["segment_size_m"], span[2], display_scale)
-    water_lines = calibrate_water_lines(grid_frame, display_scale, lanes_visible)
-
-    lines_frame = draw_lines(grid_frame.copy(), water_lines, (255, 0, 0), "lane", display_scale)
-    boundaries = calibrate_lane_boundaries(lines_frame, display_scale, lanes_visible)
-
-    cv2.destroyAllWindows()
-
-    json_path = save_calibration(args.video, frame_number, corners, H, span, water_lines, boundaries, config)
-    preview_path = save_preview_image(frame, H, config, span, water_lines, boundaries, args.video)
+    print(f"Calibrating {args.video} automatically...")
+    json_path, preview_path, scale_samples = calibrate_video(args.video, config)
 
     print(f"Saved calibration: {json_path}")
     print(f"Saved preview image: {preview_path}")
-    print("Check the preview image -- if the grid does not follow the pool edges, rerun this tool.")
+    print(f"Length scale estimated from {scale_samples} frames' worth of swimmer body size (approximate -- "
+          f"see CLAUDE.md section 3 amendment).")
+    print("Look at the preview image -- if the grid does not roughly follow the pool edges, the water-colour "
+          "thresholds in config.yaml's calibration section may need adjusting for this footage.")
 
 
 if __name__ == "__main__":

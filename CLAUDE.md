@@ -53,7 +53,7 @@ features that are out of scope. If a future need is obvious, write one line in
 | Device | CUDA GPU on the local machine |
 | Model family | Ultralytics YOLO11 (detection + pose) |
 | Tracker | ByteTrack |
-| Pixel-to-metre conversion | Homography from 4 manually clicked points |
+| Pixel-to-metre conversion | Homography, fully automatic (see amendment below -- no wall is visible in this footage, so width is exact via lane ropes and length is an approximate anthropometric estimate) |
 | Lap definition | Swimmer goes to the far wall and returns |
 | Experiment tracking | MLflow, local file store |
 | Version control | Git, initialised inside the project |
@@ -93,6 +93,50 @@ filtered out before it ever sees them; (2) the "reuse the old ID" rule
 already specified below (8.1) for a track reappearing in the same lane is
 implemented as a real merge step, since it's relied on more heavily here
 than a strong detector would need.
+
+**Amendment (approved during Phase 3, calibration): pixel-to-metre
+conversion is no longer manually clicked.** No frame in any checked clip
+from this camera rig ever shows a pool wall or any other feature with a
+precisely known real-world distance along the swim direction (confirmed
+across a full clip's duration and 4 other candidate clips) -- lane rope
+floats are a uniform pattern with no colour-coded distance markers. A
+manually-typed length span was therefore always a guess, and guessing on a
+short span gets amplified roughly 10x when extrapolated across the full 25m
+pool, producing a badly wrong calibration in practice.
+
+**Decision (approved):** replace manual clicking entirely with automatic
+calibration in `src/calibrate.py`:
+- The pool water is segmented by colour, and the boundary between open
+  water and the lane rope floats is traced and fitted to a line -- this is
+  the one lane rope this method can reliably find (colour segmentation
+  proved far more robust than edge/line detection directly on the rippled
+  water surface, which was tried first and produced unusable noise).
+- Lane *width*'s real value is still exact (2.5m, FINA standard), but its
+  *pixel placement* is now also a heuristic, not click-verified: the far
+  edge of the lane is approximated as a fraction of the remaining image
+  gap to the frame's bottom edge, since a second rope could not be reliably
+  detected either way. `pool_area_margin_m` was widened (1.5 to 3.0) to
+  absorb this.
+- Lane *length* scale has no real landmark available, so it is estimated
+  approximately from the swimmer's own detected body size (shoulder-to-hip
+  torso length via pose against an assumed average adult value), sampled
+  across many frames (250) and filtered hard: a pixel-length sanity floor
+  turned out to matter more than keypoint confidence, since a handful of
+  badly-placed keypoints scored high confidence anyway and would have
+  thrown off the estimate by several times if not caught. Even filtered,
+  the raw estimate is clamped to 0.7x-1.6x the pool's known true length
+  (25m) as a prior, since the raw measurement alone was observed to be
+  wrong by more than 3x in testing. Measured results on two real clips:
+  P010 came out to 27.7m (11% over, no clamping needed); P023 came out to
+  46.2m raw, clamped to 40m (60% over) -- the accuracy genuinely varies
+  clip to clip, which is why every calibration and every downstream
+  distance/speed number carries a `"scale_method":
+  "approximate_anthropometric"` flag, in the same spirit as the
+  provisional benchmark comparisons (section 8.7).
+- The manual click-based tool is removed, not kept as a fallback -- the
+  user's role is to supply a video, nothing else.
+
+This changes the fixed decision in the table above and section 7 below.
 
 ---
 
@@ -220,46 +264,61 @@ cache:
 
 ## 7. The calibration tool (`src/calibrate.py`)
 
-This is the most important piece for accuracy. Build it first and build it well.
+**Rewritten per the Phase 3 amendment above: fully automatic, no clicking.**
+This is still the most important piece for accuracy, which is exactly why
+the length-scale limitation is measured and flagged rather than hidden.
 
-### What the user does
-The tool opens one frame from the video and the user clicks. Nothing is typed
-except confirmations. Every click is undoable with a key press.
+### What it does
+Given just a video, with no user interaction:
 
-**Step 1 — Pool corners.**
-The user clicks 4 points on the pool whose real-world distances are known.
-Normally the four corners of the water surface. The tool then computes a
-homography so that any pixel on the water surface maps to a real position in
-metres.
+**Step 1 — Find the pool and the nearest lane rope.**
+Segment the water region by colour (the pool's turquoise is distinct from
+sky/stands/deck, once restricted to the lower part of the frame where the
+pool always is in this camera's framing -- otherwise blue-painted building
+trim can be confused for water). Edge/line detection directly on the water
+surface was tried first and failed -- ripple texture produced too much
+noise for Hough line detection to find a rope reliably. Instead, the
+boundary between open water and the lane rope floats sitting on the
+surface is traced (the topmost water pixel in every column) and fitted to
+a line -- this is one real, reliably-detected lane rope.
 
-Show the user the grid drawn back onto the frame immediately after the fourth
-click. If the grid does not follow the pool edges, the clicks were wrong and
-the user should be able to redo them.
+**Step 2 — Corners and width.**
+Two points sampled near and far along the fitted rope give one side of the
+4 corners a manual click would have produced. A second rope could not be
+reliably detected, so the lane's other edge is approximated as a fraction
+of the remaining image gap to the frame's bottom edge (a heuristic, tuned
+and sanity-checked visually against real footage). Lane width's real value
+is still exact: 2.5m (FINA standard) -- only its pixel placement is
+approximate.
 
-**Step 2 — Water line per lane.**
-Perspective means the water surface is not a single horizontal line in the
-image. The near lane's water line sits lower in the picture than the far
-lane's.
+**Step 3 — Water line and lane boundary.**
+A rope floats on the water surface, so its own pixel position at any point
+along its length already is that lane's water line -- no separate detection
+needed. The same ropes double as the lane boundaries.
 
-For each lane, the user clicks 2 points along the water surface in that lane.
-The tool stores a line per lane. This is the reference for "the hand has
-entered the water."
-
-**Step 3 — Lane boundaries.**
-The user clicks the dividing lines between lanes. This lets the system assign
-each tracked swimmer to a lane, and lets us keep a swimmer's ID stable — a
-swimmer never changes lane, so if the tracker loses someone and picks them up
-again in the same lane, it is the same person.
+**Step 4 — Length scale (approximate).**
+No wall or other known-distance landmark is visible in this footage (see
+the Phase 3 amendment). Sample the swimmer's torso length (shoulder
+midpoint to hip midpoint) via pose across 250 frames, keep only readings
+above a pixel-length sanity floor (badly-placed keypoints can still score
+high confidence), and clamp the result to 0.7x-1.6x the pool's known true
+length as a prior against a noisy measurement. This remains a provisional
+estimate, not a measurement -- every calibration is saved with
+`"scale_method": "approximate_anthropometric"`, and every distance/speed
+number computed from it should be presented as provisional, the same as
+the benchmark comparisons in section 8.7.
 
 ### Output
-One JSON file per video in `data/calibration/`, named after the video. It
-contains: the 4 corner points, the homography matrix, the per-lane water
-lines, the lane boundaries, the frame number used, and the pool length.
+Same as before: one JSON file per video in `data/calibration/`, named after
+the video, containing the 4 corner points, the homography matrix, the
+per-lane water lines, the lane boundaries, the frame number used, the pool
+length, and now `scale_method` and `scale_estimate_clamped_to_prior` flags.
 
 ### Verification
-After calibration, save a single preview image showing the grid, water lines,
-and lane boundaries drawn over the frame. The user should be able to look at
-that one image and tell whether the calibration is right.
+Same preview image as before (grid, water lines, lane boundaries drawn over
+the frame) -- still worth checking, since automatic lane-rope detection can
+fail on a frame with unusual lighting or occlusion, and there is no click
+step left to catch that by eye before it happens.
 
 ---
 
