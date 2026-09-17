@@ -4,9 +4,21 @@ video:
 pool:
   length_m: 25
   lanes: 6
+  lane_width_m: 2.5           # FINA standard lane width, needed for the calibration homography
   segment_size_m: 2.5         # Size of each grid strip drawn on the video
   clean_zone_start_m: 5       # Skip the dive and the push-off
   clean_zone_end_m: 20        # Skip the approach to the wall
+
+calibration:
+  display_max_width: 1600     # calibration window is shown scaled to this width so it fits on screen
+
+camera_motion:
+  # The available footage uses a camera that pans/tracks the swimmer (see
+  # CLAUDE.md section 3 amendment), so every frame's own motion must be
+  # measured and corrected before comparing pixel positions to the
+  # calibration, which was done on one fixed reference frame.
+  background_region_frac: 0.35   # top fraction of the frame used to track background (sky/stands), never the pool or swimmer
+  min_good_features: 40          # below this many matched background features, the motion estimate for that frame is not trusted
 
 detection:
   model: yolo11m.pt

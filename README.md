@@ -11,9 +11,16 @@ This is a proof of concept, not the production system.
 
 Build order (CLAUDE.md section 17) in progress. Completed so far:
 1. Project skeleton, config, git, MLflow wiring — **done**
+2. Video shortlist (`data/candidates.md`), sourced from the local
+   University of Malta Swim2 dataset rather than the web — **done**. Found
+   the camera pans/tracks the swimmer rather than staying fixed; recorded
+   an approved amendment in CLAUDE.md section 3 to compensate for this in
+   `detect_track.py` (not built yet).
+3. Calibration tool (`src/calibrate.py`) — **done**, needs to be run by a
+   person (it's click-based) to actually calibrate a chosen video.
 
-Everything else (calibration, detection/tracking, pose, events, metrics,
-rendering, manual review, web page) is not built yet.
+Everything else (detection/tracking, pose, events, metrics, rendering,
+manual review, web page) is not built yet.
 
 ## Requirements
 
@@ -38,9 +45,31 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 ## Running
 
-Nothing is runnable end-to-end yet. Stages will be documented here as they
-are completed, and wired into `run.py` — the single entry point the user
-runs once the pipeline exists.
+Nothing is wired into `run.py` yet — until the full pipeline exists, run
+each finished stage directly.
+
+### Calibration
+
+```
+.venv\Scripts\python.exe src\calibrate.py data\raw\<video-file>.MP4
+```
+
+Opens one frame in a window. Click through three steps:
+
+1. **4 pool corners** (near-left, near-right, far-right, far-left of the
+   visible water surface). You'll be asked in the terminal how much of the
+   pool length (in metres) those corners span — press enter to accept the
+   default (the whole pool), or type e.g. `5,20` if only a shorter, known
+   segment is visible. Then how many lanes wide the corners are (default 1).
+   A grid is drawn back over the frame immediately — press `y` to accept it
+   or `r` to redo the clicks if the grid doesn't follow the pool edges.
+2. **Water line per lane** — 2 clicks per lane, near edge to far edge.
+3. **Lane boundaries** — 2 clicks per boundary line (lanes + 1 of them).
+
+`u` undoes the last click at any point, `q` cancels. Output: a JSON file
+and a `_preview.png` in `data/calibration/`, named after the video — look
+at the preview image and confirm the grid, water lines, and lane boundaries
+actually follow the pool before trusting the calibration.
 
 ## MLflow
 
