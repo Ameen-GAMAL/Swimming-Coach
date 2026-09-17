@@ -58,8 +58,11 @@ each finished stage directly.
 
 ### Calibration
 
+Run as a module (not a plain script path) so `src.profiling` resolves
+correctly, the same as the other stages below:
+
 ```
-.venv\Scripts\python.exe src\calibrate.py data\raw\<video-file>.MP4
+.venv\Scripts\python.exe -m src.calibrate data\raw\<video-file>.MP4
 ```
 
 Opens one frame in a window. Click through three steps:
