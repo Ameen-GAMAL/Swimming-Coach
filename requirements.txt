@@ -1,4 +1,5 @@
 ultralytics>=8.3.0
+lap>=0.5.12                 # required by ultralytics' ByteTrack matching code
 opencv-python>=4.9
 numpy>=1.26
 pandas>=2.2

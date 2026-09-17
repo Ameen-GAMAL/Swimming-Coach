@@ -12,6 +12,19 @@ pool:
 calibration:
   display_max_width: 1600     # calibration window is shown scaled to this width so it fits on screen
 
+pool_area_margin_m: 1.5       # allowed slack around the calibrated pool area before a detection is discarded as outside the pool
+
+tracking:
+  # ByteTrack settings (matches the fixed decision: Tracker = ByteTrack).
+  # Values are the library's own defaults, made visible here so they're tunable.
+  track_high_thresh: 0.25     # first-stage match threshold; raise for cleaner tracks, lower to keep more
+  track_low_thresh: 0.10      # second-stage threshold for low-score matches
+  new_track_thresh: 0.25      # start a new track if no match scores at least this
+  track_buffer: 30            # frames to keep a lost track alive before dropping it
+  match_thresh: 0.80          # association similarity threshold (IoU-based)
+  fuse_score: true            # combine detection confidence with motion/IoU when matching
+  id_reuse_max_gap_sec: 2.0   # if a track ends and a new one starts in the same lane within this long, treat it as the same swimmer
+
 camera_motion:
   # The available footage uses a camera that pans/tracks the swimmer (see
   # CLAUDE.md section 3 amendment), so every frame's own motion must be
@@ -19,10 +32,21 @@ camera_motion:
   # calibration, which was done on one fixed reference frame.
   background_region_frac: 0.35   # top fraction of the frame used to track background (sky/stands), never the pool or swimmer
   min_good_features: 40          # below this many matched background features, the motion estimate for that frame is not trusted
+  orb_features: 1200             # ORB keypoints per frame
+  match_resize_width: 1600       # background region is shrunk to this width before ORB runs, for speed
+  ratio_test_threshold: 0.75     # Lowe's ratio test cutoff for a "good" feature match, before RANSAC
 
 detection:
   model: yolo11m.pt
-  conf_threshold: 0.35
+  # Low on purpose: ByteTrack is designed to use low-confidence detections
+  # for track recovery (its own track_high_thresh/track_low_thresh below do
+  # that filtering), so this should sit at or below track_low_thresh, not
+  # act as the final confidence gate. Measured on real footage: the
+  # pretrained "person" class is weak on swimmers (horizontal, partly
+  # submerged, unusual angle vs COCO's mostly-upright training data) --
+  # median top confidence per frame was only ~0.13. See CLAUDE.md section 3
+  # amendment notes / Phase 4 report for the measurement.
+  conf_threshold: 0.10
   batch_size: 16
   half_precision: true
 

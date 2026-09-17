@@ -18,9 +18,14 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
    `detect_track.py` (not built yet).
 3. Calibration tool (`src/calibrate.py`) — **done**, needs to be run by a
    person (it's click-based) to actually calibrate a chosen video.
+4. Detection and tracking (`src/detect_track.py`) — **done**, including
+   camera-motion compensation and lane-based track ID merging. Verified to
+   run correctly end-to-end on real footage; full accuracy validation is
+   still pending a real calibration (see "Known limitations" below for two
+   real findings from this stage).
 
-Everything else (detection/tracking, pose, events, metrics, rendering,
-manual review, web page) is not built yet.
+Everything else (pose, events, metrics, rendering, manual review, web page)
+is not built yet.
 
 ## Requirements
 
@@ -71,6 +76,21 @@ and a `_preview.png` in `data/calibration/`, named after the video — look
 at the preview image and confirm the grid, water lines, and lane boundaries
 actually follow the pool before trusting the calibration.
 
+### Detection and tracking
+
+Requires a calibration for the video first.
+
+```
+.venv\Scripts\python.exe -m src.detect_track data\raw\<video-file>.MP4
+```
+
+Runs YOLO11 person detection and ByteTrack over every frame, corrects for
+the camera's own motion, discards detections outside the calibrated pool
+area, assigns each track to a lane, and merges track IDs that reappear in
+the same lane shortly after a gap. Result is cached to `cache/detect_track/`
+keyed on video, model, and confidence threshold — rerunning with the same
+settings reuses the cache instantly.
+
 ## MLflow
 
 Local file store at `./mlruns`.
@@ -89,6 +109,8 @@ prefix requires recording it here first:
 
 - `video_*` — source video properties
 - `detect_*` — detection stage
+- `track_*` — ByteTrack tracker settings (added in Phase 4, see CLAUDE.md
+  section 3 amendments)
 - `pose_*` — pose stage
 - `calib_*` — calibration values
 - `event_*` — event-detection stage
@@ -99,9 +121,31 @@ prefix requires recording it here first:
 
 ## Known limitations
 
-Documented once real footage has been run through the pipeline (CLAUDE.md
-section 16): frame rate, resolution, camera angle, and the placeholder
-benchmark ranges all cap the accuracy ceiling of this POC.
+CLAUDE.md section 16's four limitations (frame rate, resolution, camera
+angle, placeholder benchmarks) apply once footage exists for accuracy
+measurement. Two more, found while building detection/tracking (Phase 4):
+
+5. **The pretrained YOLO11 "person" class is weak on swimmers in this
+   footage.** Measured median top-of-frame confidence across a full clip
+   was only ~0.13 — a horizontal, partly-submerged swimmer viewed from this
+   close, low camera angle looks quite different from COCO's mostly-upright
+   training data. Mitigated by running detection at a low confidence
+   threshold (letting ByteTrack's own two-stage matching do the filtering
+   it's designed for) and by merging track IDs that reappear in the same
+   lane shortly after a gap (CLAUDE.md section 8.1). This keeps the
+   swimmer's identity stable, but real accuracy on the actual measurements
+   (stroke rate, distance per cycle) is only established once tested
+   against a real calibration and ground truth — an argument for a
+   fine-tuned or swimming-specific detector in the production system, not
+   an excuse to skip measuring here.
+
+6. **Matching every frame directly against one fixed reference frame
+   degrades over a clip.** With a panning camera (see amendment above),
+   background overlap between a frame and the reference frame shrinks as
+   the pan accumulates — inlier matches dropped from ~90 to single digits
+   over a 45s clip when tried this way. Fixed by chaining frame-to-frame
+   matches instead (each frame matched against the previous one), which
+   keeps overlap consistently high regardless of total pan.
 
 ## Deferred (explicitly out of scope, not built)
 

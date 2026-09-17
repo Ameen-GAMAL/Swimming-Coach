@@ -64,11 +64,35 @@ alongside the swimmer rather than staying fixed. A single static homography
 would silently under-report distance and speed as the pan accumulates. The
 pixel-to-metre conversion is still homography-from-4-points as specified,
 but `detect_track.py` now also measures each frame's camera motion (via
-background optical flow, away from the pool and swimmer) and corrects
+background feature matching, away from the pool and swimmer) and corrects
 tracked pixel positions back to the calibration reference frame before any
 downstream stage uses them. No change to the calibration tool itself, and
 no extra clicks for the user. See `data/candidates.md` for the measurements
 that motivated this.
+
+**Amendment detail (Phase 4, measured during build):** matching every frame
+directly against the single calibration reference frame degrades as the pan
+accumulates -- inlier feature matches dropped from ~90 near the reference
+frame to single digits by the end of a 45s clip, since the visible
+background eventually barely overlaps the reference frame's. The working
+implementation instead matches each frame against the previous frame and
+chains the transforms together (composing them frame by frame), which keeps
+overlap consistently high regardless of total pan. Positions are still
+finally expressed relative to the calibration's reference frame.
+
+**Amendment (Phase 4, measured during build):** the pretrained YOLO11
+"person" class is measurably weak on swimmers in this footage -- median
+top-of-frame detection confidence was only ~0.13 across a full clip, likely
+because a horizontal, partly-submerged swimmer viewed from this close, low
+angle looks quite different from COCO's mostly-upright training data. Two
+consequences, both implemented: (1) `detection.conf_threshold` in
+`config.yaml` is set low (0.10) rather than high, so ByteTrack -- whose
+design already expects and uses a range of detection confidences -- gets
+the full signal to work with instead of having weak-but-real detections
+filtered out before it ever sees them; (2) the "reuse the old ID" rule
+already specified below (8.1) for a track reappearing in the same lane is
+implemented as a real merge step, since it's relied on more heavily here
+than a strong detector would need.
 
 ---
 
@@ -244,13 +268,15 @@ that one image and tell whether the calibration is right.
 ### 8.1 Detection and tracking (`src/detect_track.py`)
 Run YOLO11 detection on every frame, person class only, in batches on the GPU.
 
-Before anything else, correct for camera motion: estimate each frame's pixel
-shift relative to the calibration reference frame using optical flow on a
-background region (sky/stands, away from the pool and swimmer), and apply
-that shift to detection coordinates. This makes every downstream stage able
-to treat the camera as if it were fixed, matching the calibration. (See the
-amendment note in section 3 — the Swim2 dataset's camera pans/tracks the
-swimmer rather than staying still.)
+Before anything else, correct for camera motion: match each frame's
+background region (sky/stands, away from the pool and swimmer) against the
+previous frame and chain those frame-to-frame transforms together, then
+express the result relative to the calibration's reference frame. This
+makes every downstream stage able to treat the camera as if it were fixed,
+matching the calibration. (See the amendment notes in section 3 — the
+Swim2 dataset's camera pans/tracks the swimmer rather than staying still,
+and matching every frame directly against the reference frame instead of
+chaining was tried first and measured to degrade over a clip.)
 
 Discard any detection whose centre falls outside the pool area from the
 calibration. Pass the surviving detections to ByteTrack so each swimmer keeps
