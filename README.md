@@ -3,9 +3,43 @@
 Takes a recorded video of a 25 m freestyle swim session, tracks each swimmer,
 detects hand-entry events, and calculates stroke rate, distance per cycle,
 clean-swim time, average speed, and cycle-time variation. Outputs a CSV plus
-an annotated video. See [CLAUDE.md](CLAUDE.md) for the full specification.
+an annotated video. See [CLAUDE.md](CLAUDE.md) for the full specification —
+read it before changing anything under "Fixed decisions" (section 3).
 
 This is a proof of concept, not the production system.
+
+**Requires an NVIDIA GPU (CUDA).** Every stage runs on `device=0` and there
+is no CPU fallback — this will not run on a machine without one.
+
+## Getting the code and data running (for a new teammate)
+
+```
+git clone <this-repo-url>
+cd swimming-poc
+```
+
+Then:
+1. Follow **Setup** below to create the venv and install dependencies.
+2. Get videos into `data/raw/` — **this folder is empty in git on purpose**
+   (`.gitignore` excludes it; raw video isn't checked in). The clips this
+   project has been built and tested against are the University of Malta
+   Swim2 dataset's `Freestyle/Above/` folder — see
+   [data/candidates.md](data/candidates.md) for the exact 12 filenames
+   approved so far and where they come from. Ask whoever set up this
+   project for access to that dataset, then either copy the approved files
+   into `data/raw/` or, if you're on the same machine/drive, hard-link them
+   (no extra disk space):
+   ```
+   New-Item -ItemType HardLink -Path data\raw\<file>.MP4 -Target <path-to-dataset>\<file>.MP4
+   ```
+   Any other freestyle, side-view swimming video will also work with the
+   pipeline — the dataset above is just what's been validated so far.
+3. `data/calibration/*.json` and `*_preview.png` for a couple of already-
+   approved videos **are** checked in, so you can run detection/pose/etc.
+   against those specific videos without recalibrating — but you still need
+   the matching video file in `data/raw/` for any stage to run, since
+   calibration alone isn't the video.
+4. Run stages in the order listed under **Running** below.
 
 ## Status
 
@@ -30,10 +64,31 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
 Everything else (events, metrics, rendering, manual review, web page) is
 not built yet.
 
+## Project layout
+
+```
+config.yaml            Every adjustable number lives here
+data/
+  candidates.md        Approved video shortlist (what's in data/raw/, and why)
+  raw/                 Video files go here (gitignored — see above)
+  calibration/         One JSON + preview PNG per calibrated video
+src/
+  calibrate.py         Automatic calibration (pool/lane/scale)
+  detect_track.py      YOLO11 detection + ByteTrack + camera-motion compensation
+  pose.py              YOLO11-pose on tracked swimmers, wrist visibility gate
+  profiling.py         MLflow + timing helpers shared by the other stages
+cache/                 Intermediate results per video/model/threshold (gitignored, auto-rebuilds)
+```
+
+See CLAUDE.md section 4 for the complete, fixed project structure — don't
+add files/folders outside it without checking with the team first.
+
 ## Requirements
 
-- Windows with an NVIDIA GPU (CUDA)
-- Python 3.12
+- Windows with an NVIDIA GPU (CUDA) — see the warning at the top
+- Python 3.12 specifically (the venv command below needs the `py` launcher
+  to have it installed; if `py -0p` doesn't list a 3.12 entry, install it
+  from python.org first)
 - Git
 
 ## Setup
@@ -45,11 +100,27 @@ pip install -r requirements.txt
 ```
 
 `--system-site-packages` reuses the machine's existing CUDA-enabled PyTorch
-install instead of re-downloading it. Verify the GPU is visible:
+install instead of re-downloading it — if your machine doesn't already have
+a working CUDA PyTorch install globally, drop that flag and expect `pip
+install` to pull one instead (larger download, ~2.5GB). Verify the GPU is
+visible:
 
 ```
 python -c "import torch; print(torch.cuda.is_available())"
 ```
+
+### Troubleshooting first run
+
+- **`ModuleNotFoundError: No module named 'lap'`** — Ultralytics' ByteTrack
+  code needs this package but doesn't declare it, and its own auto-updater
+  can install it into the wrong Python environment. Fix directly:
+  `.venv\Scripts\python.exe -m pip install lap`
+- **First run of any stage downloads a model** (`yolo11m.pt`,
+  `yolo11m-pose.pt`, ~40MB each, from Ultralytics' GitHub releases) —
+  needs internet access once; cached locally after that.
+- **Run stages as a module** (`-m src.calibrate`, not
+  `src\calibrate.py` directly) — the plain script path won't resolve the
+  `src.profiling` import.
 
 ## Running
 
