@@ -58,6 +58,18 @@ features that are out of scope. If a future need is obvious, write one line in
 | Experiment tracking | MLflow, local file store |
 | Version control | Git, initialised inside the project |
 
+**Amendment (approved during Phase 2, video sourcing):** the available
+footage (University of Malta Swim2 dataset) uses a camera that pans/tracks
+alongside the swimmer rather than staying fixed. A single static homography
+would silently under-report distance and speed as the pan accumulates. The
+pixel-to-metre conversion is still homography-from-4-points as specified,
+but `detect_track.py` now also measures each frame's camera motion (via
+background optical flow, away from the pool and swimmer) and corrects
+tracked pixel positions back to the calibration reference frame before any
+downstream stage uses them. No change to the calibration tool itself, and
+no extra clicks for the user. See `data/candidates.md` for the measurements
+that motivated this.
+
 ---
 
 ## 4. Project structure
@@ -231,6 +243,15 @@ that one image and tell whether the calibration is right.
 
 ### 8.1 Detection and tracking (`src/detect_track.py`)
 Run YOLO11 detection on every frame, person class only, in batches on the GPU.
+
+Before anything else, correct for camera motion: estimate each frame's pixel
+shift relative to the calibration reference frame using optical flow on a
+background region (sky/stands, away from the pool and swimmer), and apply
+that shift to detection coordinates. This makes every downstream stage able
+to treat the camera as if it were fixed, matching the calibration. (See the
+amendment note in section 3 — the Swim2 dataset's camera pans/tracks the
+swimmer rather than staying still.)
+
 Discard any detection whose centre falls outside the pool area from the
 calibration. Pass the surviving detections to ByteTrack so each swimmer keeps
 a stable ID.
@@ -244,7 +265,11 @@ Cache the result keyed on video filename plus model plus thresholds.
 ### 8.2 Pose (`src/pose.py`)
 Run YOLO11-pose on the tracked swimmers only. The pretrained model already
 outputs the points we need: nose, shoulders, elbows, wrists, hips, knees,
-ankles.
+ankles. Apply the same per-frame camera-motion correction from
+`detect_track.py` to the keypoint coordinates, so every pixel coordinate
+that leaves this stage is already in calibration-reference-frame space —
+`events.py` can then compare a wrist position straight to a lane's water
+line with no further correction.
 
 **Measure before assuming.** The first thing this module reports is: in what
 percentage of frames was a wrist detected with confidence above the threshold?
