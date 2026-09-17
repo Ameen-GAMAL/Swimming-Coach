@@ -79,6 +79,8 @@ events:
   wrist_conf_threshold: 0.40
   min_cycle_seconds: 0.6      # Anything faster than this is noise
   smoothing_window: 5         # Frames, to steady the wrist signal
+  confidence_drop_window_frames: 15  # how many frames after a crossing to look for the confidence dip/rise that confirms it
+  min_track_frames_for_analysis: 60  # tracks shorter than this can't show even one full stroke cycle -- skip rather than produce a near-empty plot
 
 quality:
   min_confidence: 0.90

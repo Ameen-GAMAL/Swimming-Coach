@@ -60,9 +60,13 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
 5. Pose (`src/pose.py`) — **done**. Measured wrist visibility on real
    footage: **80.7%**, above CLAUDE.md's 70% gate (section 8.2), so the
    pretrained pose model is good enough to continue without fine-tuning.
+6. Events (`src/events.py`) — **done**. Hand entry/exit detection with a
+   state machine (fixed a real bug during build — see "Known limitations"
+   below), plus the wrist-signal plot artifact. Verified on real footage:
+   8 entries paired with 8 exits on the one track long enough to analyse.
 
-Everything else (events, metrics, rendering, manual review, web page) is
-not built yet.
+Everything else (metrics, rendering, manual review, web page) is not built
+yet.
 
 ## Project layout
 
@@ -185,6 +189,22 @@ enough and needs a decision from the user (CLAUDE.md section 8.2's
 fallback is annotating 300–500 frames and fine-tuning). Measured on real
 footage so far: **80.7%**.
 
+### Events
+
+Requires pose to have run for the video first (runs it automatically via
+the cache if not).
+
+```
+.venv\Scripts\python.exe -m src.events data\raw\<video-file>.MP4
+```
+
+Detects hand-entry and hand-exit moments per tracked swimmer, tracking
+whichever wrist is detected more confidently on average (the one nearer
+the camera). Skips tracks too short to contain a full stroke cycle
+(`events.min_track_frames_for_analysis`). Saves a wrist-height-over-time
+plot per analysed track to `outputs/` — check this when a result looks
+wrong, per CLAUDE.md section 8.3.
+
 ## MLflow
 
 Local file store at `./mlruns`.
@@ -254,6 +274,13 @@ measurement. Two more, found while building detection/tracking (Phase 4):
    distance and speed numbers from this POC should be read as
    directionally useful, not as precise measurements, until real footage
    with a visible wall (or another true landmark) is available.
+
+8. **Detecting hand-entry and hand-exit crossings independently double-
+   counted exits.** Signal jitter right at the water line, on a track long
+   enough to matter, produced 31 detected exits against only 8 entries
+   (Phase 6) — they should roughly pair up. Fixed with a state machine
+   (the hand can only exit after entering, and vice versa), confirmed
+   correct on real footage: 8 entries, 8 exits.
 
 ## Deferred (explicitly out of scope, not built)
 

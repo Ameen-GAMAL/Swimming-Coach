@@ -389,6 +389,22 @@ A **stroke cycle** runs from one hand entry to the next entry of the same hand.
 Save the wrist-height-over-time signal as an artifact. When something looks
 wrong, that plot is how the user diagnoses it.
 
+**Amendment (Phase 6, found during build):** detecting entry and exit
+crossings independently let jitter in the smoothed signal right at the
+water line produce a burst of spurious exits for one real entry (measured:
+31 exits vs 8 entries before this fix, when they should roughly pair up).
+Fixed with a state machine: the hand can only exit after an entry, and
+can't enter again until it has exited, so events strictly alternate.
+Confirmed correct on real footage: 8 entries paired with 8 exits.
+
+Also skips tracks shorter than `events.min_track_frames_for_analysis` (60
+frames) before running detection on them -- given the tracking
+fragmentation from Phase 4 (a weak pretrained detector produces many short
+track fragments for one real swimmer), most fragments are too short to
+contain even one full stroke cycle, and analysing/plotting all of them
+produces mostly noise. On the one real, long-enough track, this correctly
+found all 8 stroke cycles.
+
 ### 8.4 Lap splitting
 The client's definition for this POC: a lap is complete when the swimmer
 reaches the far wall and comes back.
