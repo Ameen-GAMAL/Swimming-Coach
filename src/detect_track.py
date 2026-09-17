@@ -76,7 +76,15 @@ def merge_lane_tracks(df, config, fps):
         )
         current_id, chain_end = None, None
         for start, end, track_id in segments:
-            if current_id is not None and start - chain_end <= max_gap_frames:
+            gap = start - chain_end if chain_end is not None else None
+            # gap must be positive: a track starting at or before the
+            # current chain's last frame overlaps it in time, meaning
+            # they're two different things tracked concurrently (real bug,
+            # found via metrics.py testing: this let two simultaneous,
+            # different detections in the same lane get merged into one
+            # identity, producing duplicate-frame rows with conflicting
+            # positions), not the same swimmer reappearing after a gap.
+            if current_id is not None and 0 < gap <= max_gap_frames:
                 id_map[track_id] = current_id
                 chain_end = max(chain_end, end)
             else:

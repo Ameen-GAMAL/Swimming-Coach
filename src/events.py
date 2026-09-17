@@ -16,8 +16,10 @@ import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
+from src.detect_track import project_point
 from src.pose import run_pose_cached
 from src.profiling import Timer, load_config
 
@@ -49,7 +51,7 @@ def pick_tracked_hand(track_df):
     return "left" if left_conf >= right_conf else "right"
 
 
-def detect_events_for_track(track_df, hand, water_line_points, config, fps):
+def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
     ev_cfg = config["events"]
     df = track_df.sort_values("frame").reset_index(drop=True)
 
@@ -93,14 +95,19 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps):
                 accepted.append(("exit", i))
                 underwater = False
 
-    events = [{
-        "event_type": kind,
-        "frame": int(df["frame"].iloc[i]),
-        "time_sec": float(df["time_sec"].iloc[i]),
-        "ref_x": float(ref_x.iloc[i]),
-        "ref_y": float(ref_y.iloc[i]),
-        "confidence": float(conf.iloc[i]),
-    } for kind, i in accepted]
+    events = []
+    for kind, i in accepted:
+        x_m, y_m = project_point(H, ref_x.iloc[i], ref_y.iloc[i])
+        events.append({
+            "event_type": kind,
+            "frame": int(df["frame"].iloc[i]),
+            "time_sec": float(df["time_sec"].iloc[i]),
+            "ref_x": float(ref_x.iloc[i]),
+            "ref_y": float(ref_y.iloc[i]),
+            "x_m": float(x_m),
+            "y_m": float(y_m),
+            "confidence": float(conf.iloc[i]),
+        })
 
     signal = pd.DataFrame({
         "frame": df["frame"], "time_sec": df["time_sec"],
@@ -142,6 +149,7 @@ def run_events(video_path, config, calibration_dir="data/calibration"):
 
     calibration = load_calibration(video_path, calibration_dir)
     water_lines_by_lane = {wl["lane"]: wl["points"] for wl in calibration["water_lines"]}
+    H = np.array(calibration["homography"])
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -160,7 +168,7 @@ def run_events(video_path, config, calibration_dir="data/calibration"):
         water_line_points = water_lines_by_lane.get(lane, next(iter(water_lines_by_lane.values())))
 
         hand = pick_tracked_hand(track_df)
-        events, signal = detect_events_for_track(track_df, hand, water_line_points, config, fps)
+        events, signal = detect_events_for_track(track_df, hand, water_line_points, config, fps, H)
         for ev in events:
             ev["track_id"] = track_id
             ev["lane"] = lane
@@ -170,7 +178,13 @@ def run_events(video_path, config, calibration_dir="data/calibration"):
         plot_path = save_wrist_signal_plot(signal, events, video_path, track_id, hand)
         plot_paths.append(plot_path)
 
-    df = pd.DataFrame(all_events)
+    # Explicit columns even when empty (zero events is a valid, honest
+    # result -- e.g. no track had a long enough, clean crossing) so the
+    # cached CSV still has a header row and can be read back rather than
+    # round-tripping to a genuinely empty, unparseable file.
+    event_columns = ["event_type", "frame", "time_sec", "ref_x", "ref_y", "x_m", "y_m",
+                      "confidence", "track_id", "lane", "hand"]
+    df = pd.DataFrame(all_events, columns=event_columns)
     entry_count = int((df["event_type"] == "entry").sum()) if not df.empty else 0
     diagnostics = {
         "event_entries_detected": entry_count,
