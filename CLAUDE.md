@@ -138,6 +138,67 @@ calibration in `src/calibrate.py`:
 
 This changes the fixed decision in the table above and section 7 below.
 
+**Amendment (investigated post-Phase 11, not adopted): motion-based
+swimmer localization to fix the weak-detector root cause.** The Phase 4
+amendment above already flags that pretrained YOLO11 confidence is weak
+on swimmers (~0.13 median); the resulting track fragmentation and empty
+metrics reports on real clips motivated trying a training-free fix:
+background-subtract two camera-motion-compensated frames within the pool
+area and use the one coherent moving region as a supplementary detection,
+fused with YOLO's own boxes in `detect_track.py` (see `detect_motion_blob`,
+`fuse_motion_detection`).
+
+Four variants were implemented and validated with visual spot-checks on a
+1200-frame slice of `DIVE_P010`, and all four failed for concrete,
+measured reasons:
+1. Diffing into a crop anchored to the calibration's *reference* frame:
+   the camera tracks the swimmer down the pool's length, so within a few
+   hundred frames the swimmer's real-world position is simply outside
+   that fixed window even though the camera's own current view still
+   frames them fine. Measured: the swimmer appeared in the crop in <1%
+   of frames.
+2. Diffing into a crop anchored to the *current* frame instead (fixes
+   #1): works for alignment, but the largest resulting motion blob is
+   consistently near-camera water ripple or specular glint, not the
+   swimmer -- this rig mounts very close to and low over the water, so
+   nearby ripples/glints displace by more pixels per frame than the
+   swimmer (who is farther off, in the adjacent lane, and mostly
+   submerged). Measured across threshold/kernel/resolution sweeps: even
+   at the best-tuned settings, sampled detections were dominated by
+   near-field noise, not the swimmer.
+3. Restricting the crop to the calibrated pool area, reprojected into
+   each current frame via the existing homography chain: this camera's
+   field of view is close enough to the water that the reprojected pool
+   area still covers nearly the whole frame, so it doesn't meaningfully
+   exclude the near-field noise from #2.
+4. A local search window anchored to each track's last known position
+   (meant to bridge short YOLO gaps rather than search the whole frame):
+   this removes the near-field-noise competition, but self-reinforces on
+   drift -- if the seed position is itself a YOLO false positive (which,
+   given ~0.13 median confidence, it often is), the window keeps
+   "successfully" re-finding whatever coherent-looking static texture
+   (e.g. the lane rope) sits at that wrong position, with no independent
+   check against it being the real swimmer. Measured: seeded from a bad
+   YOLO box, the window locked onto lane-rope texture for the following
+   1000+ frames.
+
+**Decision:** motion-detection fusion is implemented but disabled
+(`camera_motion.motion_fusion_enabled: false` in `config.yaml`) rather
+than removed -- injecting these detections would make tracking worse, not
+better, since ByteTrack has no way to tell a synthesized false positive
+from a real one. The camera-motion alignment code this relies on (warping
+one frame into another's own current framing, not a stale fixed
+reference) is a genuine, kept improvement over the bug described in
+variant 1 above, and the plumbing (`motion_crop_rect`,
+`motion_crop_transform`, `detect_motion_blob`, `fuse_motion_detection`)
+is reusable for a future, better-verified localization signal -- most
+promisingly a per-frame colour/appearance model (skin tone, cap colour,
+or splash-white against the pool's turquoise water), which sidesteps
+frame-to-frame alignment and near-field parallax entirely, since it
+doesn't need a temporal diff at all. That wasn't attempted this session
+for lack of time; see the build's final summary for current status and
+recommended next steps.
+
 ---
 
 ## 4. Project structure
@@ -349,6 +410,32 @@ ID.
 
 Cache the result keyed on video filename plus model plus thresholds.
 
+**Amendment (reliability pass, post-Phase 11): colour-based swimmer
+localization is now the active supplementary detection signal**, replacing
+the motion-based approach investigated and rejected in section 3's
+amendment above. Per frame (not temporal, so it doesn't depend on the
+camera-motion chain at all): segment out the pool's own water colour using
+the same HSV thresholds `calibrate.py` already trusts, then look for a
+skin/dark-cap/white-splash-coloured blob near that water body. Fused with
+YOLO's own boxes the same way the motion approach was designed to (trust
+YOLO first; synthesize a detection only when nothing already covers the
+blob) -- see `detect_color_blob`/`fuse_synthetic_detection`. Validated by
+visual spot-check on real footage. See `config.yaml`'s `color_localize`
+section for the full parameter rationale.
+
+**Amendment (reliability pass, post-Phase 11): the background region used
+for camera-motion matching is now sized per-clip, not a fixed fraction.**
+Measured on real footage: `camera_motion.background_region_frac=0.35`
+(tuned against DIVE_P010, where the stands fill that band) captured almost
+nothing but plain sky on DIVE_P023, whose stands sit lower in frame --
+ORB found zero matched features in 63% of frames there, not just "few".
+Fixed by deriving the boundary from the calibration's own detected
+pool-top corner position per clip instead (falling back to the old 0.35 as
+a floor, never shrinking below what was already validated). Measured
+effect on DIVE_P023: frames with a usable camera-motion estimate went from
+5% to 93%, and tracks-found (after lane merge) dropped from 249 to 83.
+See `dynamic_background_region_frac`.
+
 ### 8.2 Pose (`src/pose.py`)
 Run YOLO11-pose on the tracked swimmers only. The pretrained model already
 outputs the points we need: nose, shoulders, elbows, wrists, hips, knees,
@@ -368,6 +455,12 @@ Log this as `quality_wrist_visible_pct`.
   that is a separate decision the user must make.
 
 Cache the result.
+
+**Amendment (reliability pass, post-Phase 11, speed):** tracks shorter than
+`events.min_track_frames_for_analysis` are filtered out *before* running
+pose inference on them, not after -- `events.py` was going to discard them
+anyway, so paying for pose inference on a weak detector's many short track
+fragments (see section 3's Phase 4 amendment) was pure waste.
 
 ### 8.3 Events (`src/events.py`)
 For each swimmer, track the wrist nearest to the camera. Record which side it
@@ -407,6 +500,20 @@ contain even one full stroke cycle, and analysing/plotting all of them
 produces mostly noise. On the one real, long-enough track, this correctly
 found all 8 stroke cycles.
 
+**Bug fix (found post-Phase 11, during the reliability pass):** the state
+machine above always initialized `underwater = False` regardless of the
+track's actual first sample -- but a track essentially never happens to
+start exactly at a real entry/exit boundary, so it just as often starts
+already submerged. When it does, the very first real transition
+(submerged → surfaced) requires `underwater` to already be `True` to
+register as a valid exit, and was silently discarded under the old
+hardcoded start. Fixed to initialize from the observed first sample
+(`underwater = not above[0]`) instead. This was very likely a contributor
+to the zero-entries/zero-exits results seen on real clips throughout this
+build, independent of any detection-quality issue -- confirmed by re-
+running on cached pose data with no other change: 0 exits before the fix,
+1 exit after, on the same track.
+
 ### 8.4 Lap splitting
 The client's definition for this POC: a lap is complete when the swimmer
 reaches the far wall and comes back.
@@ -443,6 +550,30 @@ Do not report a score when any of these is true:
 
 When the gate blocks a result, the CSV row still exists but the measurement
 columns are empty and a `rejection_reason` column explains why. Never guess.
+
+**Amendment (explicit user request, reliability pass, post-Phase 11):**
+measured that on both real clips tested, no continuously-tracked window
+ever contains 2 consecutive hand-entries -- the clip ends, or tracking
+drops, mid-cycle every time -- and separately, no window ever fully spans
+the clean zone's 20m boundary before running out. Two changes, together,
+to stop reporting a fully blank row when there's real, usable partial
+data:
+- `quality.min_valid_cycles` lowered from 3 to 1. Below this count,
+  `stroke_rate_cpm`/`distance_per_cycle_m`/`cycle_time_cv_pct` are blanked
+  (as before) with a `data_quality_note` column explaining why.
+- **Speed and clean-swim-time are no longer gated on cycle count or
+  confidence at all** -- they come from position tracking alone, an
+  independent signal from hand-entry detection, so a missing stroke count
+  shouldn't blank an otherwise-valid speed measurement. They ARE still
+  gated on reaching the clean zone in the first place.
+- A length that reaches only *part* of the clean zone (not both the 5m
+  and 20m boundaries) is no longer a hard rejection: speed/time are
+  computed over whatever sub-range was actually tracked, and the row is
+  flagged `partial_clean_zone_coverage: true` with a
+  `clean_zone_coverage_note` (e.g. "partial clean-zone coverage (10.2m of
+  15.0m)") so it's never mistaken for the full 15m measurement. A length
+  that never touches the clean zone at all is still a hard rejection —
+  everything blanked, `rejection_reason` explains why.
 
 ### 8.7 Benchmarks and scoring
 
@@ -651,6 +782,17 @@ A single Gradio page. Deliberately minimal:
 
 No login, no database, no styling work. It exists so the client can try the
 system themselves rather than watch a screen recording.
+
+**Amendment (explicit user request, reliability pass): styling work is now
+in scope, overriding "no styling work" above.** Rebuilt with a themed
+layout and four tabs (Run Analysis / Results / Diagnostics / About), a
+real per-stage progress checklist instead of one undifferentiated bar,
+provisional/rejected-result callouts as a styled coloured panel rather
+than a markdown line, a small chart of accepted-length metrics, and a
+Diagnostics tab surfacing the calibration preview, wrist-signal plots, and
+each stage's own diagnostics (frames processed, tracks found, wrist
+visibility %, quality-gate detail). Still no login, no database -- those
+weren't asked for.
 
 ---
 

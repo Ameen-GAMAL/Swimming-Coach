@@ -96,17 +96,55 @@ def compute_length_metrics(df, a, b, events_df, pose_track_df, hand, config):
     lo, hi = min(zone_start_m, zone_end_m), max(zone_start_m, zone_end_m)
 
     start_time, end_time = df["time_sec"].iloc[a], df["time_sec"].iloc[b]
-    direction = "forward" if df["y_m_smoothed"].iloc[b] > df["y_m_smoothed"].iloc[a] else "backward"
-
-    t1 = crossing_time(df, a, b, lo)
-    t2 = crossing_time(df, a, b, hi)
+    y_a, y_b = df["y_m_smoothed"].iloc[a], df["y_m_smoothed"].iloc[b]
+    direction = "forward" if y_b > y_a else "backward"
     result = {"start_time_sec": start_time, "end_time_sec": end_time, "direction": direction}
-    if t1 is None or t2 is None:
-        return {**result, "rejection_reason": "did not cross both clean-zone boundaries"}
 
+    # The full clean zone (5-20m) exists to skip the dive/push-off and the
+    # wall-approach distortion -- but on real footage a continuously
+    # tracked segment doesn't always span the whole thing (a short clip
+    # can end, or tracking can drop, before the swimmer reaches the far
+    # boundary). Rather than reject that outright, measure over whatever
+    # portion of the clean zone this segment actually covers, and flag it
+    # clearly rather than silently reporting a partial distance as if it
+    # were the full 15m (see CLAUDE.md section 8.5 amendment).
+    seg_lo, seg_hi = min(y_a, y_b), max(y_a, y_b)
+    overlap_lo, overlap_hi = max(lo, seg_lo), min(hi, seg_hi)
+    if overlap_hi <= overlap_lo:
+        return {**result, "rejection_reason": "this length's tracked position never reaches the clean zone (5-20m)"}
+
+    def boundary_time(target_y):
+        t = crossing_time(df, a, b, target_y)
+        if t is not None:
+            return t
+        # target_y sits at (or past) one end of the segment's own range --
+        # no sign change to interpolate, so use whichever endpoint is closer.
+        return start_time if abs(y_a - target_y) <= abs(y_b - target_y) else end_time
+
+    t1, t2 = boundary_time(overlap_lo), boundary_time(overlap_hi)
     zone_enter_time, zone_exit_time = min(t1, t2), max(t1, t2)
     clean_swim_time = zone_exit_time - zone_enter_time
-    clean_distance_m = hi - lo
+    clean_distance_m = overlap_hi - overlap_lo
+
+    # A genuine partial-coverage window can still be short, but a human
+    # swimmer physically cannot cover real pool distance in a few dozen
+    # milliseconds -- that combination means the "length" is turn-detection
+    # noise (a spurious zigzag from position jitter/a tracking
+    # discontinuity), not a real partial observation. The full-crossing
+    # requirement this replaces used to filter these out implicitly, since
+    # noise essentially never spans the full 15m; the partial-coverage path
+    # needs its own explicit sanity check instead (measured on real
+    # footage: without it, noise segments produced "speeds" of 180-200 m/s).
+    implied_speed = clean_distance_m / clean_swim_time if clean_swim_time > 0 else float("inf")
+    max_speed = config["quality"]["max_plausible_speed_ms"]
+    if clean_swim_time <= 0 or implied_speed > max_speed:
+        return {**result, "rejection_reason": f"implied speed ({implied_speed:.1f} m/s) exceeds what's "
+                f"physically plausible ({max_speed} m/s) -- likely a tracking discontinuity, not a real length"}
+
+    partial_coverage = overlap_lo > lo or overlap_hi < hi
+    result["partial_clean_zone_coverage"] = partial_coverage
+    if partial_coverage:
+        result["clean_zone_coverage_note"] = f"partial clean-zone coverage ({clean_distance_m:.1f}m of {hi - lo:.1f}m)"
 
     events_in_length = events_df[
         (events_df["time_sec"] >= start_time) & (events_df["time_sec"] <= end_time)
@@ -123,7 +161,7 @@ def compute_length_metrics(df, a, b, events_df, pose_track_df, hand, config):
             continue
         exit_i = exit_between.iloc[0]
 
-        if not (lo <= entry_i["y_m"] <= hi) or not (lo <= exit_i["y_m"] <= hi):
+        if not (overlap_lo <= entry_i["y_m"] <= overlap_hi) or not (overlap_lo <= exit_i["y_m"] <= overlap_hi):
             continue
         if not (zone_enter_time <= entry_i["time_sec"] <= zone_exit_time):
             continue
@@ -148,24 +186,45 @@ def compute_length_metrics(df, a, b, events_df, pose_track_df, hand, config):
 
 
 def apply_quality_gate(result, config):
-    q = config["quality"]
-    reasons = []
+    # A hard rejection from compute_length_metrics (the tracked position
+    # never reached the clean zone at all) blanks everything -- there's
+    # nothing usable to report.
     if result.get("rejection_reason"):
-        reasons.append(result["rejection_reason"])
-    if (result.get("cycle_count") or 0) < q["min_valid_cycles"]:
-        reasons.append(f"fewer than {q['min_valid_cycles']} complete cycles in the clean zone "
-                        f"(found {result.get('cycle_count', 0)})")
-    if result.get("mean_wrist_confidence") is None or result["mean_wrist_confidence"] < q["min_confidence"]:
-        conf = result.get("mean_wrist_confidence")
-        reasons.append(f"mean wrist confidence {conf:.2f} below {q['min_confidence']}" if conf is not None
-                        else "no confidence data for any counted cycle")
-    if result.get("occluded"):
-        reasons.append("a hand entry was not followed by a matching exit before the next entry (occluded)")
-
-    if reasons:
         blanked = {col: None for col in MEASUREMENT_COLUMNS}
-        return {**result, **blanked, "rejection_reason": "; ".join(reasons)}
-    return {**result, "rejection_reason": ""}
+        return {**result, **blanked}
+
+    # Past that point, speed and clean-swim-time come from position
+    # tracking alone and don't need any stroke-cycle data to be valid --
+    # gating them on cycle count/confidence would blank a perfectly good
+    # measurement just because a *different* signal (hand-entry detection)
+    # was insufficient. Only the cycle-derived numbers (stroke rate,
+    # distance per cycle, their variability) need their own gate.
+    q = config["quality"]
+    notes = []
+    cycle_count = result.get("cycle_count") or 0
+    cycle_ok = cycle_count >= q["min_valid_cycles"]
+    conf = result.get("mean_wrist_confidence")
+    conf_ok = conf is not None and conf >= q["min_confidence"]
+
+    out = dict(result)
+    if not cycle_ok or not conf_ok:
+        for col in ["stroke_rate_cpm", "distance_per_cycle_m", "cycle_time_cv_pct", "mean_wrist_confidence"]:
+            out[col] = None
+        if not cycle_ok:
+            notes.append(f"fewer than {q['min_valid_cycles']} complete cycle(s) measured in the tracked window "
+                         f"(found {cycle_count}) -- stroke-cycle metrics not reported")
+        if not conf_ok:
+            notes.append(f"mean wrist confidence {conf:.2f} below {q['min_confidence']}" if conf is not None
+                         else "no confidence data for any counted cycle")
+
+    if result.get("occluded"):
+        notes.append("a hand entry was not followed by a matching exit before the next entry -- some cycles may be missing")
+    if result.get("partial_clean_zone_coverage"):
+        notes.append(result.get("clean_zone_coverage_note", "partial clean-zone coverage"))
+
+    out["data_quality_note"] = "; ".join(notes)
+    out["rejection_reason"] = ""
+    return out
 
 
 def compare_to_benchmark(value, bounds):
@@ -194,12 +253,19 @@ def aggregate_laps(length_rows):
     laps = []
     for i in range(0, len(length_rows) - 1, 2):
         first, second = length_rows[i], length_rows[i + 1]
-        if first["rejection_reason"] or second["rejection_reason"]:
+        usable = (not first["rejection_reason"] and not second["rejection_reason"]
+                  and first.get("average_speed_ms") is not None and second.get("average_speed_ms") is not None)
+        if not usable:
             laps.append({"length_indices": (i, i + 1), "rejection_reason": "one or both lengths in this lap were rejected"})
             continue
         total_time = first["clean_swim_time_sec"] + second["clean_swim_time_sec"]
         total_cycles = first["cycle_count"] + second["cycle_count"]
-        total_distance = 2 * (config_clean_distance(first))
+        # Each length may cover a different partial slice of the clean zone
+        # (see the compute_length_metrics amendment) -- sum them separately
+        # rather than assuming they match, so a lap made of two differently-
+        # partial lengths still gets the right total distance.
+        total_distance = config_clean_distance(first) + config_clean_distance(second)
+        notes = [n for n in (first.get("data_quality_note"), second.get("data_quality_note")) if n]
         laps.append({
             "length_indices": (i, i + 1),
             "clean_swim_time_sec": total_time,
@@ -207,6 +273,7 @@ def aggregate_laps(length_rows):
             "cycle_count": total_cycles,
             "stroke_rate_cpm": (total_cycles / total_time * 60) if total_time > 0 and total_cycles else None,
             "distance_per_cycle_m": (total_distance / total_cycles) if total_cycles else None,
+            "data_quality_note": "; ".join(notes),
             "rejection_reason": "",
         })
     return laps

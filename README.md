@@ -11,11 +11,53 @@ This is a proof of concept, not the production system.
 **Requires an NVIDIA GPU (CUDA).** Every stage runs on `device=0` and there
 is no CPU fallback — this will not run on a machine without one.
 
+## Quickstart (under 5 minutes)
+
+Gets the app installed and running, so you can click through the UI —
+**not** a full analysis, which takes far longer (see the honest timings
+below). Assumes Python 3.12 and a working CUDA install are already on the
+machine; if `--system-site-packages` below can't find a CUDA PyTorch,
+drop that flag and expect `pip install` to pull one instead (~2.5GB,
+takes longer than 5 minutes on its own).
+
+```powershell
+git clone https://github.com/Ameen-GAMAL/Swimming-Coach.git
+cd Swimming-Coach
+py -3.12 -m venv .venv --system-site-packages
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python app.py
+```
+
+Open **http://127.0.0.1:7860** — you'll see the app running with its four
+tabs (Run Analysis / Results / Diagnostics / About). That's the 5-minute
+part.
+
+**To actually click "Run analysis" and get a result**, you need a video
+in `data/raw/` first — the repo ships with no video data (see
+**Getting the code and data running** just below) — and then realistic
+time budget, not 5 minutes:
+
+| Stage | Typical time (one ~45-55s clip) |
+|---|---|
+| Calibration (automatic, first run only) | ~1-2 min |
+| Detection & tracking | ~5-8 min |
+| Pose | ~30-90 min (depends heavily on how much of the swimmer the detector finds — see "Known limitations") |
+| Events / Metrics | a few seconds |
+| Rendering the annotated video | ~2-4 min |
+
+This is a research pipeline running several ML models per frame on full
+4K source video, not a production-tuned service — the times above are
+measured, not estimated. First run of any stage also downloads its model
+checkpoints (`yolo11x.pt` ~110MB for detection, `yolo11m-pose.pt` ~40MB
+for pose) from Ultralytics' GitHub releases — needs internet access once,
+cached locally after.
+
 ## Getting the code and data running (for a new teammate)
 
 ```
-git clone <this-repo-url>
-cd swimming-poc
+git clone https://github.com/Ameen-GAMAL/Swimming-Coach.git
+cd Swimming-Coach
 ```
 
 Then:
@@ -75,9 +117,29 @@ Build order (CLAUDE.md section 17) in progress. Completed so far:
    an agent; the non-interactive parts (clip extraction, cross-video
    ground-truth accumulation) are verified. Not one of CLAUDE.md's
    original 8 files — see section 13's amendment note.
-10. Web page (`app.py`) — **done**. Verified end-to-end through the actual
-    UI: upload/pick a video, run the full pipeline, see the annotated
-    video and results table.
+10. Web page (`app.py`) — **done**, then rebuilt with a themed, tabbed
+    layout (Run Analysis / Results / Diagnostics / About), a real
+    per-stage progress checklist, styled provisional/rejected-result
+    callouts, and a small accepted-metrics chart — see "Reliability pass"
+    below.
+
+**Reliability pass (post-Phase 11):** in response to real clips producing
+empty reports, root-caused and fixed several issues:
+- Replaced motion-based supplementary detection (investigated, found
+  unreliable on this footage's close/wide-angle camera geometry, and
+  disabled) with a colour-based signal instead — see CLAUDE.md section
+  8.1's amendment.
+- Fixed a real bug in `events.py`'s entry/exit state machine that silently
+  discarded a track's first transition whenever it started already
+  submerged (very likely on almost every track) — see section 8.3's
+  amendment.
+- Fixed the camera-motion background region being a fixed fraction of
+  frame height, which worked for DIVE_P010 but captured almost no usable
+  texture on DIVE_P023 (zero matched features in 63% of frames) — now
+  sized per-clip from the calibration's own pool-top boundary. Measured
+  effect on DIVE_P023: usable camera-motion frames went from 5% to 93%.
+- Sped up `pose.py` by filtering out tracks too short for `events.py` to
+  ever use, before paying for pose inference on them.
 
 Remaining: accuracy measurement against real ground truth needs a person
 to actually run `review.py` (see "Known limitations" and the final
@@ -134,9 +196,9 @@ python -c "import torch; print(torch.cuda.is_available())"
   code needs this package but doesn't declare it, and its own auto-updater
   can install it into the wrong Python environment. Fix directly:
   `.venv\Scripts\python.exe -m pip install lap`
-- **First run of any stage downloads a model** (`yolo11m.pt`,
-  `yolo11m-pose.pt`, ~40MB each, from Ultralytics' GitHub releases) —
-  needs internet access once; cached locally after that.
+- **First run of any stage downloads a model** (`yolo11x.pt` ~110MB for
+  detection, `yolo11m-pose.pt` ~40MB for pose, from Ultralytics' GitHub
+  releases) — needs internet access once; cached locally after that.
 - **Run stages as a module** (`-m src.calibrate`, not
   `src\calibrate.py` directly) — the plain script path won't resolve the
   `src.profiling` import.
@@ -378,65 +440,76 @@ becomes obvious during the build (CLAUDE.md section 2).
 
 Every pipeline stage in the build order is built and runs end-to-end,
 including through the actual Gradio UI. Reporting the real results
-honestly, including the failures, per section 15:
+honestly, including the journey to get there, per section 15.
+
+**Updated after a reliability pass (post-Phase 11):** the "nothing to
+report" result below was the state before this pass. Four real, root-
+caused fixes changed that:
+1. Colour-based supplementary detection (replacing a motion-based
+   approach that was tried and measured to fail — see CLAUDE.md section
+   3's amendment).
+2. A real bug fix in `events.py` (wrong initial state discarded a
+   track's first transition on almost every track).
+3. Per-clip camera-motion background region (fixed DIVE_P023's near-total
+   tracking failure: 5% → 93% usable frames).
+4. By explicit user request: the quality gate now reports speed/time over
+   whatever partial clean-zone distance was actually tracked, clearly
+   labelled, instead of requiring the full 15m span — see CLAUDE.md
+   section 8.6's amendment for exactly what changed and why.
+
+**Current real result, verified through the actual UI:** `DIVE_P023` now
+produces **one accepted length** — 2.7m of the 15m clean zone, 1.33s,
+2.05 m/s average speed (a physically plausible freestyle pace), correctly
+flagged `partial_clean_zone_coverage` with no stroke-cycle data (too few
+hand-entries tracked in a row) rather than blanked outright. `DIVE_P010`
+still produces zero accepted lengths — an honest result: its longest
+continuously-tracked segment never reaches the clean zone at all. Several
+implausible "lengths" (position-jitter noise from the turn-detection
+algorithm, one showing an implied speed of 196 m/s) are correctly
+rejected by a new physical-plausibility check, not silently reported.
 
 **What works, measured on real footage:**
-- Wrist visibility: **80.7%**, clearing the 70% gate — the pretrained
-  pose model doesn't need fine-tuning.
-- Camera-motion compensation: reliable after switching from matching
-  every frame against one fixed reference (which degraded over a clip)
-  to chaining frame-to-frame matches.
+- Wrist visibility: **80.6-80.7%**, clearing the 70% gate on both test
+  clips — the pretrained pose model doesn't need fine-tuning.
+- Camera-motion compensation: reliable after (a) chaining frame-to-frame
+  matches instead of matching every frame against one fixed reference,
+  and (b) sizing the background-matching region per clip instead of a
+  fixed fraction.
 - The full mechanical pipeline (calibrate → detect/track → pose → events
   → metrics → render) runs without crashing on real video, with a real
-  (automatic) calibration, through the actual web page.
+  (automatic) calibration, through the actual web page — verified live in
+  a browser this session, not just from the CLI.
 - `metrics.py`'s maths is verified correct: tested against a synthetic
-  ideal-swimmer signal, every one of the five client metrics (clean swim
-  time, average speed, stroke rate, distance per cycle, cycle-time
-  variation) came out exactly right, and the quality gate correctly
-  rejects and blanks a result when confidence is too low.
+  ideal-swimmer signal, every one of the five client metrics came out
+  exactly right, and the quality gate correctly rejects/blanks a result
+  when the data doesn't support it.
 
-**What doesn't work yet, and why — the honest part:**
-- **Against CLAUDE.md's own success criteria (section 15), this POC does
-  not currently produce an accepted measurement on the test footage.**
-  On the clip tested most (`DIVE_P010`), after fixing a real track-merge
-  bug found while building `metrics.py`, no single track has enough
-  continuous, valid position/pose data to complete even one full length
-  inside the clean zone. The pipeline's response to this is exactly what
-  CLAUDE.md's quality gate is supposed to do: report nothing rather than
-  guess. That is the gate working correctly — the underlying cause is the
-  pretrained detector's weak performance on swimmers in this footage
-  (median confidence ~0.13, documented in Phase 4), which the available
-  footage's extreme camera angle and dataset (single-swimmer trials, not
-  race conditions) makes worse, not something metrics.py or events.py
-  got wrong. **Confirmed on a second, independent clip** (`DIVE_P023`):
-  same "nothing to report" result, but via a different mechanism this
-  time — the two tracks long enough to analyse both fell in a stretch
-  late in the clip (44-54s into a 54s video) where camera-motion
-  estimation was never reliable, so every position came out as a gap
-  rather than a wrong number. Two different real clips failing for two
-  related-but-distinct reasons, both rooted in the same underlying
-  footage limitations, is a stronger signal than one clip failing once.
+**What still doesn't work, and why — the honest part:**
+- **No clip yet produces a full 3-cycle stroke-rate measurement.**
+  Measured directly: on the longest, cleanest continuously-tracked
+  segment found across both clips (728 frames, 98% pose success, a
+  genuinely clean recovery→pull→recovery signal), the swimmer's second
+  hand-entry never happens because the *video itself ends* one frame
+  before it would. A cycle needs two consecutive entries; neither test
+  clip's footage is long enough relative to this swimmer's stroke tempo
+  to contain that in one continuous window. This is a data/footage
+  limitation, not a code defect — confirmed by checking the raw frame
+  numbers, not inferred.
 - **Length-scale calibration accuracy varies by clip and is only
-  approximate by construction**: 11% over on one clip, up to 60% over
-  (after clamping; 85% raw) on another. There is no way to make this
-  exact with the available footage, because no frame in it ever shows a
-  pool wall.
-- **Accuracy measurement against real ground truth (this step's other
-  half) has not been done** — CLAUDE.md section 13's review tool is
-  interactive by design (a person judges each detected event), so an
-  agent cannot generate it. `src/review.py` is built and its
-  non-interactive parts are verified; running it against real detected
-  events, across the 3-4 videos the spec asks for, is a task for a
-  person at the keyboard.
+  approximate by construction**: no frame in the available footage ever
+  shows a pool wall, so there's no way to make this exact with what's
+  available.
+- **Accuracy measurement against real ground truth has not been done** —
+  `src/review.py`'s interactive review is a task for a person at the
+  keyboard, not an agent.
 
 **What this means for the production camera spec** (the actual point of
-a POC, per CLAUDE.md's opening framing): the biggest, clearest argument
-this POC produces is that the *camera setup* needs to change for the
-production system — a camera that pans, sits at deck level close enough
-that a wall never enters frame, and produces footage where a general-
-purpose pretrained detector performs this poorly, will not give reliable
-measurements no matter how well the downstream pipeline is built. A
-fixed, wider-framed, higher, more stable camera (as CLAUDE.md section 16
-already argues for on frame-rate/resolution grounds) would likely fix
-most of what's currently blocking real numbers, independently of any
-software change here.
+a POC, per CLAUDE.md's opening framing): the software-side fixes this
+session closed most of the gap that detection/tracking/camera-motion
+quality was responsible for. What's left pointing at hardware, not code:
+longer continuous clips (or a camera framing that keeps the swimmer in
+view for a full 25m, not just part of it) are needed to ever measure a
+complete stroke cycle, and a wall-visible framing is needed for exact
+distance calibration. Both were already CLAUDE.md section 16's
+recommendation on separate (frame-rate/resolution) grounds; this session
+adds a third, independent reason to the same conclusion.

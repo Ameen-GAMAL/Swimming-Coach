@@ -42,29 +42,78 @@ tracking:
   track_buffer: 30            # frames to keep a lost track alive before dropping it
   match_thresh: 0.80          # association similarity threshold (IoU-based)
   fuse_score: true            # combine detection confidence with motion/IoU when matching
-  id_reuse_max_gap_sec: 2.0   # if a track ends and a new one starts in the same lane within this long, treat it as the same swimmer
+  id_reuse_max_gap_sec: 2.0   # if a track ends and a new one starts within this long, treat it as the same swimmer (dataset is single-swimmer, single-lane trials -- see data/candidates.md)
+  min_segment_frames_for_merge: 5  # a track-ID segment shorter than this doesn't anchor the merge chain -- measured on real footage: 74% of all segments are exactly 1 frame (noise blips, often a YOLO box and a colour-fusion box of the same swimmer that didn't overlap enough to count as one detection), and letting them anchor the chain caused spurious time-overlaps that kept resetting it instead of bridging real gaps. See detect_track.py's merge_continuous_tracks.
+  max_overlap_frames_for_merge: 50   # two substantial segments overlapping in time by up to this many frames may still be merged, if their mean positions agree (see max_merge_distance_m) -- measured on real footage: this is usually ByteTrack briefly double-tracking the same swimmer during an ID handoff, not a second object
+  max_merge_distance_m: 3.0          # how close two segments' mean positions must be to treat a time-overlap as the same swimmer, not a genuinely different concurrent object -- a bit more than one lane width (2.5m) to allow for position noise
 
 camera_motion:
   # The available footage uses a camera that pans/tracks the swimmer (see
   # CLAUDE.md section 3 amendment), so every frame's own motion must be
   # measured and corrected before comparing pixel positions to the
   # calibration, which was done on one fixed reference frame.
-  background_region_frac: 0.35   # top fraction of the frame used to track background (sky/stands), never the pool or swimmer
+  background_region_frac: 0.35   # FLOOR, not a fixed value -- detect_track.py's dynamic_background_region_frac raises this per-clip using the calibration's own pool-top boundary, never shrinks below this. A fixed fraction doesn't generalize: measured on real footage, this default was fine for DIVE_P010 (stands fill that band) but captured almost nothing but plain sky for DIVE_P023 (stands sit lower in that clip's framing), giving zero matched ORB features in 63% of frames -- see CLAUDE.md section 3 amendment.
   min_good_features: 40          # below this many matched background features, the motion estimate for that frame is not trusted
   orb_features: 1200             # ORB keypoints per frame
   match_resize_width: 1600       # background region is shrunk to this width before ORB runs, for speed
   ratio_test_threshold: 0.75     # Lowe's ratio test cutoff for a "good" feature match, before RANSAC
 
+  # Motion-based swimmer localization -- fixes the root cause behind most
+  # other problems (weak pretrained "person" detection on swimmers, see
+  # CLAUDE.md section 3 amendment): after motion-compensating two
+  # consecutive frames into the same reference alignment, the water
+  # background nearly cancels out and the swimmer is the one large,
+  # coherent region of real change. Used to confirm/supplement YOLO,
+  # not replace it -- YOLO's own detections are always trusted first.
+  motion_fusion_enabled: false    # OFF -- see CLAUDE.md section 3 amendment. Measured on real footage: whole-crop background subtraction is consistently won by near-field ripple/glint noise and lane-rope texture (both closer to this low, wide-angle camera than the swimmer, so they show larger frame-to-frame pixel displacement); a local-window variant anchored to each track's last position self-reinforces onto a wrong static feature once the seed position is off. Code kept (and the camera-motion alignment fix below is a real improvement over the old fixed-reference-window bug) so a future, better-verified swimmer-localization signal (e.g. colour/appearance-based, not motion-based) can reuse the plumbing without re-deriving it.
+  motion_detect_width: 1600       # pool-area crop is warped to this width for the diff -- needs to stay high enough that the swimmer survives as a multi-pixel blob after morphological cleanup (measured: 640 shrank the swimmer to a few px and lost them behind noise almost every frame)
+  motion_diff_threshold: 25       # pixel intensity difference to count as "changed" between aligned frames
+  motion_min_area_frac: 0.001     # a blob smaller than this fraction of the crop is noise, not the swimmer
+  motion_max_area_frac: 0.5       # a blob larger than this is a lighting/alignment glitch, not the swimmer
+  motion_yolo_iou_match: 0.1      # if a YOLO box overlaps the motion blob at least this much, trust YOLO's and don't synthesize one
+  motion_synthetic_confidence: 0.5  # placeholder confidence given to a detection synthesized from the motion blob (matches roughly track_high_thresh, so ByteTrack treats it as a solid detection)
+
+color_localize:
+  # Colour-based swimmer localization -- the fix that replaced motion-based
+  # detection above (see CLAUDE.md section 3 amendment). Per frame, not
+  # temporal: the swimmer's skin/dark cap/white splash foam differ in hue
+  # from the pool's turquoise water (reusing calibration's own water HSV
+  # thresholds below), and this doesn't depend on frame-to-frame camera-
+  # motion alignment at all, sidestepping the near-field parallax/glint
+  # problem that broke the motion approach. Validated by visual spot-check
+  # on real footage: every sampled detection landed on/at the swimmer, once
+  # candidates were restricted to be near the actual water body (see
+  # near_water_margin_px below) -- without that restriction, warm-toned
+  # background objects (e.g. a building facade) were occasionally
+  # misflagged as skin-hue. Recall is modest (roughly a quarter of frames
+  # in the tested slice), which is fine for a signal meant to supplement
+  # YOLO, not replace it -- the swimmer is only clearly visible (not
+  # submerged) part of the time anyway.
+  enabled: true
+  downscale_width: 1280           # frame is shrunk to about this width before HSV thresholding, for speed (measured: full-res ~71ms/frame vs ~8ms/frame at this size)
+  search_top_frac: 0.35           # same idea as camera_motion.background_region_frac -- skip the sky/stands strip, never the pool
+  search_bottom_margin_frac: 0.15 # also skip the nearest-camera water strip -- measured to carry the worst ripple/glint clutter
+  skin_hue_max: 30                # OpenCV H (0-179): skin tone / dark cap sits low; pool water sits much higher (see calibration.water_hue_* below) -- measured on real footage: swimmer samples read H~11-14, water H~86-93
+  white_splash_sat_max: 15        # white splash foam: low saturation
+  white_splash_value_min: 210     # ...and high brightness
+  near_water_margin_px: 14        # in the DOWNSCALED frame's own pixels -- a candidate must be within this margin of the main water body to count, which is what excludes background objects that are also skin-hue by colour but aren't near the pool at all
+  body_height_pad_multiplier: 2.5 # the raw colour blob (skin/splash) is usually much shorter than a full swimmer body -- pad its height by this factor (centred, so its centre point/real-world position is unchanged) so it overlaps ByteTrack's predicted full-body box well enough to extend a track, and gives pose.py's crop enough of the body to find keypoints in. Measured on real footage: colour-blob median height ~36px vs YOLO's own swimmer-box median height ~89px, ratio ~2.5
+  min_area_frac: 0.0002           # fraction of the search region's area
+  max_area_frac: 0.01
+  morph_kernel: 3
+  yolo_iou_match: 0.1             # if a YOLO box overlaps the colour blob at least this much, trust YOLO's and don't synthesize one
+  synthetic_confidence: 0.5       # placeholder confidence given to a detection synthesized from the colour blob
+
 detection:
-  model: yolo11m.pt
+  model: yolo11x.pt  # upgraded from yolo11m.pt (reliability pass, post-Phase 11): measured on 5 real frames across DIVE_P010, the largest pretrained variant found the swimmer in a frame where yolo11m and yolo11l found nothing at all, and averaged ~73% higher top confidence (0.31 vs 0.18) -- a free win, no new data or training needed, since it's the same pretrained COCO checkpoint family, just more capacity. See CLAUDE.md section 3 amendment.
   # Low on purpose: ByteTrack is designed to use low-confidence detections
   # for track recovery (its own track_high_thresh/track_low_thresh below do
   # that filtering), so this should sit at or below track_low_thresh, not
   # act as the final confidence gate. Measured on real footage: the
   # pretrained "person" class is weak on swimmers (horizontal, partly
   # submerged, unusual angle vs COCO's mostly-upright training data) --
-  # median top confidence per frame was only ~0.13. See CLAUDE.md section 3
-  # amendment notes / Phase 4 report for the measurement.
+  # median top confidence per frame was only ~0.13 with yolo11m. See
+  # CLAUDE.md section 3 amendment notes / Phase 4 report for the measurement.
   conf_threshold: 0.10
   batch_size: 16
   half_precision: true
@@ -84,7 +133,8 @@ events:
 
 quality:
   min_confidence: 0.90
-  min_valid_cycles: 3
+  min_valid_cycles: 1  # relaxed from 3, by explicit user request, after measuring that neither available test clip ever contains 2 consecutive hand-entries in one continuously-tracked window -- the clip length runs out (or tracking drops) mid-cycle every time. Below this count, stroke_rate_cpm/distance_per_cycle_m are blanked with a data_quality_note explaining why (see metrics.py's apply_quality_gate); speed/clean-swim-time are position-based and are not gated on cycle count at all -- see CLAUDE.md section 8.5 amendment.
+  max_plausible_speed_ms: 3.0  # generously above elite freestyle (~2.2-2.5 m/s) -- a "length" whose implied speed exceeds this is turn-detection noise (a spurious zigzag from position jitter/a tracking discontinuity), not a real swim; rejected outright rather than reported as a partial observation. Needed once partial clean-zone coverage was accepted (see above): the old full-15m-crossing requirement filtered these out implicitly, since noise essentially never spans the whole clean zone.
 
 benchmarks:
   provisional: true           # These are placeholder numbers, not real data

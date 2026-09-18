@@ -78,8 +78,15 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
     # water line produces a burst of spurious exits for one real entry
     # (measured: 31 exits vs 8 entries before this fix, when they should
     # roughly pair up).
+    # Initialized from the observed first sample, not hardcoded to "starts
+    # surfaced" -- a track almost never happens to begin exactly at a real
+    # entry/exit boundary, so it can just as easily start already
+    # submerged. Measured: with a hardcoded False start, a track beginning
+    # mid-underwater had its first (and sometimes only) real transition
+    # silently discarded, since an "exit" can only register once
+    # `underwater` is True.
     accepted = []
-    underwater = False
+    underwater = not above[0]
     last_entry_frame = None
     for i in range(1, len(df)):
         frame_num = df["frame"].iloc[i]

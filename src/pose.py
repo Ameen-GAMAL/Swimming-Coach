@@ -70,6 +70,20 @@ def run_pose(video_path, config, calibration_dir="data/calibration"):
     if tracks_df.empty:
         raise RuntimeError("No tracked swimmers found -- nothing to run pose on.")
 
+    # events.py discards any track shorter than min_track_frames_for_analysis
+    # before it ever looks at pose data, so paying for pose inference on
+    # those frames is pure waste -- on real footage the vast majority of
+    # tracks are short fragments (a few frames each) from a detector that's
+    # weak on this footage (see CLAUDE.md section 3 amendment), so this cuts
+    # total pose work substantially without changing any result.
+    min_frames = config["events"]["min_track_frames_for_analysis"]
+    track_lengths = tracks_df["track_id"].value_counts()
+    long_enough_ids = track_lengths[track_lengths >= min_frames].index
+    tracks_df = tracks_df[tracks_df["track_id"].isin(long_enough_ids)]
+    if tracks_df.empty:
+        raise RuntimeError(
+            f"No track has at least {min_frames} frames -- nothing long enough for pose/event analysis.")
+
     model = YOLO(config["pose"]["model"])
     conf_threshold = config["pose"]["conf_threshold"]
     batch_size = config["pose"]["batch_size"]
