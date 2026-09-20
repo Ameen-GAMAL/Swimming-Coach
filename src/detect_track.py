@@ -140,6 +140,15 @@ def merge_continuous_tracks(df, config, fps):
 
     df = df.copy()
     df["track_id"] = df["track_id"].replace(id_map)
+    # Merging two briefly-overlapping segments into one id leaves that id with
+    # two rows on every frame of the overlap -- two different positions for
+    # one swimmer at one instant, which downstream stages read as real
+    # movement (and pose then runs twice on the same frame). Keep the
+    # better-scored detection on those frames.
+    df = (df.sort_values("score", ascending=False)
+            .drop_duplicates(subset=["track_id", "frame"], keep="first")
+            .sort_values(["track_id", "frame"])
+            .reset_index(drop=True))
     return df
 
 
@@ -183,15 +192,15 @@ def detect_orb_features(orb, frame_bg_bgr, resize_width):
 
 
 def estimate_step_homography(matcher, anchor_kp, anchor_des, cur_kp, cur_des, config):
-    """Matches the current frame's background against the last successfully
-    matched frame (the "anchor"), not the fixed calibration reference frame.
-    Consecutive frames always have high background overlap regardless of how
-    far the camera has panned overall, whereas matching everything against
-    one fixed reference frame degrades as the pan accumulates -- measured on
-    real footage, inlier matches dropped from ~90 near the reference frame to
-    single digits by the end of a 45s clip. Returns a homography mapping the
-    CURRENT frame's pixels to the ANCHOR frame's pixels, plus the inlier
-    count (so a step with too little texture to trust can be flagged)."""
+    """Matches the current frame's background against a held keyframe (the
+    "anchor"), not the fixed calibration reference frame and not the
+    immediately preceding frame. Matching everything against one fixed
+    reference degrades as the pan accumulates (measured: inliers fell from
+    ~90 near the reference frame to single digits by the end of a 45s
+    clip), but re-anchoring every frame is worse -- see the keyframe
+    comment in run_detect_track. Returns a homography mapping the CURRENT
+    frame's pixels to the ANCHOR frame's pixels, plus the inlier count (so
+    a step with too little texture to trust can be flagged)."""
     if cur_des is None or anchor_des is None or len(cur_des) < 4 or len(anchor_des) < 4:
         return None, 0
 
@@ -209,6 +218,19 @@ def estimate_step_homography(matcher, anchor_kp, anchor_des, cur_kp, cur_des, co
     if M is None or good_matches < config["camera_motion"]["min_good_features"]:
         return None, good_matches
     return M, good_matches
+
+
+def homography_displacement_px(M, frame_w, frame_h):
+    """How far this homography actually moves the image, as the median shift
+    of probe points spread across the frame. Drives the keyframe re-anchor
+    decision: a step is only worth composing into the chain once the view
+    has moved well clear of findHomography's RANSAC reprojection threshold."""
+    probes = np.float32([[frame_w * fx, frame_h * fy]
+                          for fx in (0.25, 0.5, 0.75) for fy in (0.25, 0.5)])
+    pts = np.hstack([probes, np.ones((len(probes), 1), np.float32)])
+    mapped = (M @ pts.T).T
+    mapped = mapped[:, :2] / mapped[:, 2:3]
+    return float(np.median(np.linalg.norm(mapped - probes, axis=1)))
 
 
 def motion_crop_rect(frame_w, frame_h, background_region_frac):
@@ -426,18 +448,41 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
     orb = cv2.ORB_create(nfeatures=config["camera_motion"]["orb_features"])
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-    # Camera-motion chain state. cumulative_M maps the current frame's pixels
-    # to frame 0's pixel space, built by composing each frame-to-previous-
-    # frame step as we go. Once the loop reaches the calibration's reference
-    # frame, its cumulative_M is captured as ref_to_frame0 -- after that,
-    # every frame's position relative to the reference frame is
-    # inv(ref_to_frame0) @ cumulative_M. Frames before the reference frame
-    # (the dive/entry, before calibration's chosen frame) are left
-    # uncorrected rather than guessed.
-    chain_kp, chain_des = None, None
-    anchor_gray = None  # raw grayscale frame matching chain_kp/chain_des, for the motion-blob diff below
-    cumulative_M = np.eye(3)
+    # Camera-motion chain state, anchored on held keyframes rather than on
+    # the previous frame. anchor_M maps the anchor keyframe's pixels to
+    # frame 0's pixel space; this frame's own transform is
+    # anchor_M @ (this frame -> anchor).
+    #
+    # Why keyframes: at this footage's 120fps the background moves only
+    # 0.15-0.25px between consecutive frames -- roughly 20x BELOW
+    # findHomography's 4px RANSAC reprojection threshold. Every
+    # frame-to-previous-frame step therefore came back as (near) identity,
+    # and composing 6485 of them silently discarded almost all of the real
+    # camera pan. Measured on DIVE_P023: over frames 722-4178 the chain
+    # reported ~25px of background motion where direct matching of the same
+    # frame pairs showed ~750px, i.e. it captured about 3% of the camera's
+    # actual movement, sometimes with the wrong sign. Because the camera
+    # pans to keep the swimmer roughly centred, essentially ALL of the
+    # swimmer's real-world displacement lives in this transform -- so
+    # losing it collapsed every track's world position to a near-constant
+    # y_m and made every downstream length/speed/cycle number meaningless.
+    #
+    # Holding an anchor until the view has genuinely moved (or matching
+    # starts to degrade) keeps each composed step far above that noise
+    # floor, and composes ~50 steps instead of ~6500, so per-step error
+    # accumulates far less too.
+    anchor_kp, anchor_des = None, None
+    anchor_gray = None  # raw grayscale frame matching anchor_kp/anchor_des, for the motion-blob diff below
+    anchor_M = np.eye(3)
+    anchor_frame_idx = 0
+    last_good = None  # (kp, des, gray, frame_M, frame_idx) -- fallback anchor when a match against the keyframe fails
     ref_to_frame0 = None
+    keyframes_promoted = 0
+    cm_cfg = config["camera_motion"]
+    reanchor_displacement_px = cm_cfg["keyframe_reanchor_displacement_px"]
+    keyframe_max_interval = cm_cfg["keyframe_max_interval_frames"]
+    keyframe_min_interval = cm_cfg["keyframe_min_interval_frames"]
+    reanchor_inlier_floor = cm_cfg["keyframe_reanchor_inlier_floor"]
 
     model = YOLO(config["detection"]["model"])
     tracker = BYTETracker(build_tracker_args(config), frame_rate=int(round(fps)))
@@ -485,29 +530,49 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
             # coherent region that doesn't cancel out. Confirms/supplements
             # YOLO; see fuse_motion_detection.
             motion_box_raw = None
-            if chain_kp is None:
+            if anchor_kp is None:
                 step_ok, good_features = True, 0  # first frame of the video: nothing to chain from yet
+                step_M, frame_M = np.eye(3), np.eye(3)
             else:
-                step_M, good_features = estimate_step_homography(matcher, chain_kp, chain_des, kp, des, config)
+                step_M, good_features = estimate_step_homography(matcher, anchor_kp, anchor_des, kp, des, config)
+                if step_M is None and last_good is not None:
+                    # The view has drifted too far from the keyframe to match
+                    # it. Fall back to the last frame that did match, make it
+                    # the new anchor and retry once, rather than dropping this
+                    # frame's position outright.
+                    anchor_kp, anchor_des, anchor_gray, anchor_M, anchor_frame_idx = last_good
+                    step_M, good_features = estimate_step_homography(matcher, anchor_kp, anchor_des, kp, des, config)
                 step_ok = step_M is not None
-                if step_ok:
-                    cumulative_M = cumulative_M @ step_M
-                    if motion_fusion_enabled:
-                        align_transform = crop_transform @ np.linalg.inv(step_M)
-                        prev_small_aligned = cv2.warpPerspective(anchor_gray, align_transform, small_size)
-                        cur_small = cv2.warpPerspective(full_gray, crop_transform, small_size)
-                        bbox_small = detect_motion_blob(cur_small, prev_small_aligned, config)
-                        if bbox_small is not None:
-                            motion_box_raw = small_bbox_to_raw(bbox_small, crop_transform)
-            if step_ok:
-                chain_kp, chain_des, anchor_gray = kp, des, full_gray  # only advance the anchor on a successful match
+                frame_M = anchor_M @ step_M if step_ok else None
+                if step_ok and motion_fusion_enabled:
+                    align_transform = crop_transform @ np.linalg.inv(step_M)
+                    prev_small_aligned = cv2.warpPerspective(anchor_gray, align_transform, small_size)
+                    cur_small = cv2.warpPerspective(full_gray, crop_transform, small_size)
+                    bbox_small = detect_motion_blob(cur_small, prev_small_aligned, config)
+                    if bbox_small is not None:
+                        motion_box_raw = small_bbox_to_raw(bbox_small, crop_transform)
 
-            if frame_idx == calibration["frame_number"]:
-                ref_to_frame0 = cumulative_M.copy()
+            if step_ok:
+                last_good = (kp, des, full_gray, frame_M, frame_idx)
+                frames_on_anchor = frame_idx - anchor_frame_idx
+                displacement = homography_displacement_px(step_M, frame_w, frame_h)
+                if anchor_kp is None or (
+                        displacement >= reanchor_displacement_px
+                        or frames_on_anchor >= keyframe_max_interval
+                        or (good_features < reanchor_inlier_floor and frames_on_anchor >= keyframe_min_interval)):
+                    anchor_kp, anchor_des, anchor_gray = kp, des, full_gray
+                    anchor_M, anchor_frame_idx = frame_M, frame_idx
+                    keyframes_promoted += 1
+
+            # Captured at the calibration frame, or at the first good frame
+            # after it if that frame's own match failed -- not silently from a
+            # stale transform.
+            if ref_to_frame0 is None and step_ok and frame_idx >= calibration["frame_number"]:
+                ref_to_frame0 = frame_M.copy()
 
             motion_ok = step_ok and ref_to_frame0 is not None
             if motion_ok:
-                M = np.linalg.inv(ref_to_frame0) @ cumulative_M
+                M = np.linalg.inv(ref_to_frame0) @ frame_M
             if not motion_ok:
                 frames_low_motion_confidence += 1
 
@@ -595,6 +660,7 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
     diagnostics = {
         "detect_frames_total": frame_count,
         "detect_frames_low_motion_confidence": frames_low_motion_confidence,
+        "detect_camera_keyframes": keyframes_promoted,
         "detect_tracks_before_merge": tracks_before_merge,
         "detect_tracks_found": df["track_id"].nunique() if not df.empty else 0,
         "detect_longest_track_frames": longest_track_frames,
@@ -609,23 +675,31 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
     return df, diagnostics
 
 
-def cache_path(video_path, config, cache_dir=None):
+def cache_path(video_path, config, cache_dir=None, calibration_dir="data/calibration"):
     cache_dir = cache_dir or os.path.join(config["cache"]["directory"], "detect_track")
     os.makedirs(cache_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    model = os.path.splitext(config["detection"]["model"])[0]
+    model = os.path.splitext(os.path.basename(config["detection"]["model"]))[0]
     conf = config["detection"]["conf_threshold"]
     # Tuning camera_motion/color_localize and rerunning should never silently
     # reuse a cached result from before the tuning change.
-    fusion_key = json.dumps(
-        {"camera_motion": config["camera_motion"], "color_localize": config["color_localize"]},
-        sort_keys=True)
-    fusion_hash = hashlib.sha1(fusion_key.encode()).hexdigest()[:10]
+    key = {"camera_motion": config["camera_motion"], "color_localize": config["color_localize"]}
+    # The calibration belongs in the key too: every x_m/y_m in the cached
+    # rows is produced by its homography, so recalibrating and rerunning
+    # otherwise returned the old world positions without a word.
+    calib_file = os.path.join(calibration_dir, f"{stem}.json")
+    if os.path.exists(calib_file):
+        with open(calib_file) as f:
+            calib = json.load(f)
+        key["calibration"] = {"homography": calib.get("homography"),
+                               "corner_span_m": calib.get("corner_span_m"),
+                               "frame_number": calib.get("frame_number")}
+    fusion_hash = hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:10]
     return os.path.join(cache_dir, f"{stem}__{model}__conf{conf}__{fusion_hash}.csv")
 
 
 def run_detect_track_cached(video_path, config, calibration_dir="data/calibration"):
-    path = cache_path(video_path, config)
+    path = cache_path(video_path, config, calibration_dir=calibration_dir)
     if config["cache"]["enabled"] and os.path.exists(path):
         print(f"Using cached detect_track result: {path}")
         return pd.read_csv(path), {"cached": True}

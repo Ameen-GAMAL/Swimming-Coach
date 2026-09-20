@@ -2,12 +2,13 @@ video:
   fps_override: null          # Leave null to read fps from the file
 
 pool:
-  length_m: 25
+  length_m: 50            # corrected from 25 (user-confirmed): this is a 50m competition pool. The old value was a second, independent scale error sitting underneath the calibration bug -- calibrate.py derives its length axis as pool_length_m * correction, so every distance was additionally halved relative to the intended premise.
   lanes: 6
   lane_width_m: 2.5           # FINA standard lane width, needed for the calibration homography
   segment_size_m: 2.5         # Size of each grid strip drawn on the video
   clean_zone_start_m: 5       # Skip the dive and the push-off
   clean_zone_end_m: 20        # Skip the approach to the wall
+  min_turn_swing_m: 8.0       # How far the smoothed position must swing back before a turn is believed. Previously this borrowed lane_width_m (2.5) -- a LATERAL measure used as a longitudinal test, and far too small: measured on a real track, position jitter reached 1.6m between consecutive frames, so 2.5m of "swing" was ordinary noise and one ~25m traverse was chopped into 7 bogus "lengths" (one of them 2.6m in 0.13s). At 8.0m that same track resolves to a single length. Should scale with length_m if the pool ever changes.
 
 calibration:
   # Automatic calibration (no clicking -- see CLAUDE.md section 3 amendment).
@@ -27,9 +28,11 @@ calibration:
   # throw the whole estimate off by several times if not filtered out.
   scale_estimate_num_samples: 250     # frames spread across the video to attempt
   scale_estimate_min_keypoint_conf: 0.30  # matches pose.conf_threshold -- the pixel-sanity floor below is what actually catches bad keypoint reads here, not confidence (a bad reading can still score high confidence)
-  scale_estimate_min_torso_px: 40     # below this, a shoulder/hip reading is almost certainly a bad keypoint, not a real torso
+  scale_estimate_min_torso_px: 40     # below this, a shoulder/hip reading is almost certainly a bad keypoint, not a real torso. Only used by the superseded torso-based estimator.
+  assumed_swimmer_box_length_m: 2.5   # what a side-on swimmer's DETECTION BOX spans along the pool axis: body (~1.8m) plus the forward arm reach of a stroking freestyler. This single number sets every distance and speed downstream, and it is an assumption, not a measurement -- good to roughly +/-15-20% because the reach varies through the stroke cycle. It replaced a shoulder-to-hip torso reading, which on this footage collapsed to ~60px on a swimmer spanning ~1040px and drove the calibration ~4x long.
+  scale_estimate_min_box_px: 200      # ignore boxes too small to be a real side-on swimmer at this camera range -- distant lanes and partial detections would otherwise bias the median
   scale_estimate_min_samples: 6        # fail loudly rather than trust a scale built from a handful of samples
-  length_scale_clamp_ratio: [0.7, 1.6]  # the anthropometric estimate is clamped to this multiple of pool.length_m -- the true length is a known constant, so it's used as a prior against a noisy measurement rather than trusting the measurement unconditionally
+  visible_span_bounds_m: [3.0, 60.0]  # how much pool LENGTH the camera can plausibly see, in metres. Replaces length_scale_clamp_ratio ([0.7, 1.6] x pool.length_m), which assumed the detected rope span was roughly the whole pool -- false here, where the camera sits at water level and sees a short stretch. Measured on DIVE_P023 that clamp forced a 40m span when the truth is under 10m, making the homography call every swimmer 8.5-11.4m long and every speed ~5.7x too slow, with the correct value unreachable by a factor of 2.5. These bounds only reject the physically absurd; the anthropometric estimate decides within them, and calibrate.py prints the implied swimmer body length as a sanity check.
 
 pool_area_margin_m: 3.0       # allowed slack around the calibrated pool area before a detection is discarded as outside the pool -- generous because the automatic calibration's lane-width edge is itself a heuristic (see CLAUDE.md section 3 amendment), not a click-verified boundary
 
@@ -57,6 +60,20 @@ camera_motion:
   orb_features: 1200             # ORB keypoints per frame
   match_resize_width: 1600       # background region is shrunk to this width before ORB runs, for speed
   ratio_test_threshold: 0.75     # Lowe's ratio test cutoff for a "good" feature match, before RANSAC
+
+  # Keyframe anchoring for the motion chain. The anchor frame is HELD for
+  # many frames instead of advancing every frame: at 120fps the background
+  # moves 0.15-0.25px per frame, ~20x below findHomography's 4px RANSAC
+  # threshold, so per-frame steps all came back as identity and composing
+  # them threw away ~97% of the real camera pan (measured on DIVE_P023:
+  # 25px reported vs ~750px actual across frames 722-4178). Since the
+  # camera pans to keep the swimmer centred, that transform carries
+  # essentially all of the swimmer's real-world motion -- losing it made
+  # every length/speed/cycle number downstream meaningless.
+  keyframe_reanchor_displacement_px: 60   # promote a new keyframe once the view has moved this far from the current one -- 15x the RANSAC threshold, so the composed step is well clear of the noise floor (measured: a 60px shift takes ~200 frames at this clip's pan rate, and still leaves ~590 inliers)
+  keyframe_max_interval_frames: 240       # hard cap (2s at 120fps) so a static camera still re-anchors occasionally rather than matching against an ever-older frame
+  keyframe_min_interval_frames: 30        # don't let the inlier-floor rule re-anchor faster than this -- below ~30 frames the motion is back under the RANSAC threshold and we'd be re-creating the per-frame bug
+  keyframe_reanchor_inlier_floor: 150     # re-anchor early when matching starts degrading, well before min_good_features (40) would fail the frame outright
 
   # Motion-based swimmer localization -- fixes the root cause behind most
   # other problems (weak pretrained "person" detection on swimmers, see
@@ -129,6 +146,7 @@ events:
   min_cycle_seconds: 0.6      # Anything faster than this is noise
   smoothing_window: 5         # Frames, to steady the wrist signal
   confidence_drop_window_frames: 15  # how many frames after a crossing to look for the confidence dip/rise that confirms it
+  max_sample_gap_frames: 15   # two pose samples further apart than this (0.125s at 120fps) are not treated as a crossing: pose emits no row when a crop yields no person, so consecutive ROWS can sit a second or more apart, and a flip across that gap was never observed -- only inferred from missing data
   min_track_frames_for_analysis: 60  # tracks shorter than this can't show even one full stroke cycle -- skip rather than produce a near-empty plot
 
 quality:

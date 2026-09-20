@@ -10,6 +10,8 @@
 # counted as a stroke.
 
 import argparse
+import hashlib
+import json
 import os
 
 import cv2
@@ -20,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from src.detect_track import project_point
+from src.pose import cache_path as pose_cache_path
 from src.pose import run_pose_cached
 from src.profiling import Timer, load_config
 
@@ -46,9 +49,13 @@ def water_line_y_at_x(water_line_points, x):
 
 
 def pick_tracked_hand(track_df):
-    left_conf = track_df["left_wrist_conf"].mean()
-    right_conf = track_df["right_wrist_conf"].mean()
-    return "left" if left_conf >= right_conf else "right"
+    """Picks whichever wrist is tracked better across the WHOLE track.
+    Scores on summed confidence rather than the mean: pandas' mean skips
+    missing values, so a wrist seen in a handful of frames at high
+    confidence used to outrank one tracked steadily across hundreds."""
+    left = float(track_df["left_wrist_conf"].fillna(0).sum())
+    right = float(track_df["right_wrist_conf"].fillna(0).sum())
+    return "left" if left >= right else "right"
 
 
 def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
@@ -63,13 +70,30 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
     water_y = ref_x.apply(lambda x: water_line_y_at_x(water_line_points, x))
     # Smaller y = higher in the image = above the water surface (hand in the air)
     above = (ref_y < water_y).to_numpy()
+    # Tri-state, not a plain boolean. pose.py emits no row at all when a
+    # crop yields no person, and leaves ref_x/ref_y NaN when the frame's
+    # camera-motion transform wasn't trusted -- and `NaN < water_y` is
+    # False, which the bare boolean read as "the hand is underwater". Every
+    # gap in pose coverage therefore looked like a submerged hand and
+    # manufactured transitions out of missing data.
+    known = (ref_y.notna() & water_y.notna()).to_numpy()
 
+    frames = df["frame"].to_numpy()
+    conf_arr = conf.to_numpy(dtype=float)
     min_cycle_frames = ev_cfg["min_cycle_seconds"] * fps
     drop_window = ev_cfg["confidence_drop_window_frames"]
+    max_sample_gap = ev_cfg["max_sample_gap_frames"]
     wrist_conf_threshold = ev_cfg["wrist_conf_threshold"]
 
     def confirmed(i, want_drop):
-        window = conf.iloc[i: min(len(df), i + drop_window)]
+        # Windowed by FRAME NUMBER, not by row count: with frames missing
+        # from pose, a fixed number of rows can span several times the
+        # intended window.
+        sel = (frames >= frames[i]) & (frames <= frames[i] + drop_window)
+        window = conf_arr[sel]
+        window = window[~np.isnan(window)]
+        if window.size == 0:
+            return False
         return (window.min() < wrist_conf_threshold) if want_drop else (window.max() >= wrist_conf_threshold)
 
     # A state machine, not independent per-crossing detection: the hand can
@@ -86,10 +110,18 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
     # silently discarded, since an "exit" can only register once
     # `underwater` is True.
     accepted = []
-    underwater = not above[0]
+    underwater = (not above[int(np.argmax(known))]) if known.any() else False
     last_entry_frame = None
     for i in range(1, len(df)):
-        frame_num = df["frame"].iloc[i]
+        # Both sides of a crossing have to be actually observed, and have to
+        # be adjacent in TIME rather than merely adjacent rows -- pose drops
+        # frames, so consecutive rows can sit a second apart, and any flip
+        # across that gap was never seen, only inferred.
+        if not (known[i] and known[i - 1]):
+            continue
+        if frames[i] - frames[i - 1] > max_sample_gap:
+            continue
+        frame_num = frames[i]
         if not underwater and above[i - 1] and not above[i]:
             if last_entry_frame is not None and (frame_num - last_entry_frame) < min_cycle_frames:
                 continue  # periodicity signal: too soon to be a real new cycle
@@ -206,8 +238,12 @@ def run_events(video_path, config, calibration_dir="data/calibration"):
 def cache_path(video_path, config, cache_dir=None):
     cache_dir = cache_dir or os.path.join(config["cache"]["directory"], "events")
     os.makedirs(cache_dir, exist_ok=True)
-    stem = os.path.splitext(os.path.basename(video_path))[0]
-    return os.path.join(cache_dir, f"{stem}.csv")
+    # Previously keyed on the video stem ALONE, so every detection model,
+    # pose model and events-threshold variation shared one cached result and
+    # a re-run after tuning silently returned the old events.
+    upstream = os.path.splitext(os.path.basename(pose_cache_path(video_path, config)))[0]
+    ev_hash = hashlib.sha1(json.dumps(config["events"], sort_keys=True).encode()).hexdigest()[:10]
+    return os.path.join(cache_dir, f"{upstream}__ev{ev_hash}.csv")
 
 
 def run_events_cached(video_path, config, calibration_dir="data/calibration"):

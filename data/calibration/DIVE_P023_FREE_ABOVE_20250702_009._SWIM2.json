@@ -1,7 +1,7 @@
 {
   "video": "DIVE_P023_FREE_ABOVE_20250702_009._SWIM2.MP4",
   "frame_number": 359,
-  "pool_length_m": 25,
+  "pool_length_m": 50,
   "corners_px": [
     [
       191.95000000000002,
@@ -22,23 +22,23 @@
   ],
   "corner_span_m": {
     "start_m": 0.0,
-    "end_m": 40.0,
+    "end_m": 21.830356869843417,
     "width_m": 2.5
   },
   "homography": [
     [
-      1.1328535243408252e-05,
+      1.1328535243408256e-05,
       0.0031217253384891205,
       -4.2429267311365
     ],
     [
-      0.011768415139839068,
-      5.553193414752098e-19,
-      -2.258947250177756
+      0.006422717477370416,
+      1.0795444929284081e-18,
+      -1.2328406001806744
     ],
     [
-      4.531414097363318e-06,
-      -6.206122006573051e-20,
+      4.5314140973633205e-06,
+      -6.126520867839809e-20,
       1.0
     ]
   ],
@@ -86,6 +86,6 @@
     }
   ],
   "scale_method": "approximate_anthropometric",
-  "scale_estimate_frames_used": 25,
-  "scale_estimate_clamped_to_prior": true
+  "scale_estimate_frames_used": 75,
+  "scale_estimate_clamped_to_prior": false
 }

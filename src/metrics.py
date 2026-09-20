@@ -248,16 +248,28 @@ def add_benchmark_comparisons(result, config):
 
 
 def aggregate_laps(length_rows):
-    # A lap is one length there and one back (CLAUDE.md section 8.4). Pairs
-    # consecutive lengths; an unpaired trailing length has no lap total.
+    # A lap is one length there and one back (CLAUDE.md section 8.4).
+    #
+    # Pairs each usable length with the next usable one going the OTHER way,
+    # rather than pairing raw list positions. Position pairing was wrong on
+    # real data: a rejected length still consumed a slot, so every later
+    # pairing shifted by one and two unrelated lengths (sometimes both
+    # running the same direction) could be summed into a single "lap".
+    # An unpaired trailing length has no lap total.
     laps = []
-    for i in range(0, len(length_rows) - 1, 2):
-        first, second = length_rows[i], length_rows[i + 1]
-        usable = (not first["rejection_reason"] and not second["rejection_reason"]
-                  and first.get("average_speed_ms") is not None and second.get("average_speed_ms") is not None)
-        if not usable:
-            laps.append({"length_indices": (i, i + 1), "rejection_reason": "one or both lengths in this lap were rejected"})
+    pending = None
+    for i, row in enumerate(length_rows):
+        if row["rejection_reason"] or row.get("average_speed_ms") is None:
             continue
+        if pending is None:
+            pending = (i, row)
+            continue
+        prev_i, first = pending
+        if first["direction"] == row["direction"]:
+            pending = (i, row)  # same way -- can't close a lap; start again from this one
+            continue
+        second = row
+        pending = None
         total_time = first["clean_swim_time_sec"] + second["clean_swim_time_sec"]
         total_cycles = first["cycle_count"] + second["cycle_count"]
         # Each length may cover a different partial slice of the clean zone
@@ -267,7 +279,7 @@ def aggregate_laps(length_rows):
         total_distance = config_clean_distance(first) + config_clean_distance(second)
         notes = [n for n in (first.get("data_quality_note"), second.get("data_quality_note")) if n]
         laps.append({
-            "length_indices": (i, i + 1),
+            "length_indices": (prev_i, i),
             "clean_swim_time_sec": total_time,
             "average_speed_ms": total_distance / total_time if total_time > 0 else None,
             "cycle_count": total_cycles,
@@ -290,16 +302,23 @@ def run_metrics(video_path, config, calibration_dir="data/calibration"):
     events_df, _ = run_events_cached(video_path, config, calibration_dir)
     pose_df, _ = run_pose_cached(video_path, config, calibration_dir)
 
-    min_swing_m = config["pool"]["lane_width_m"]  # a real turn moves further than a lane's width; jitter shouldn't
+    min_swing_m = config["pool"]["min_turn_swing_m"]
     rows = []
     for track_id, track_pos in tracks_df.groupby("track_id"):
-        if events_df.empty or track_id not in events_df["track_id"].unique():
-            continue
-        track_events = events_df[events_df["track_id"] == track_id]
-        pose_track_df = pose_df[pose_df["track_id"] == track_id]
-        if pose_track_df.empty:
-            continue
-        hand = pick_tracked_hand(pose_track_df)
+        # Hand events are OPTIONAL for a length to be worth reporting.
+        # Speed and clean-swim-time come from position tracking alone, and
+        # apply_quality_gate already blanks only the cycle-derived numbers
+        # when there aren't enough cycles. Skipping the whole track when it
+        # had no events (the previous behaviour) threw away a perfectly
+        # good speed measurement and directly contradicted that gate's
+        # stated design -- measured: it was the sole reason a clip whose
+        # entry detection found nothing reported zero lengths rather than
+        # position-only ones.
+        no_events = events_df.iloc[0:0]
+        track_events = (events_df[events_df["track_id"] == track_id]
+                        if not events_df.empty else no_events)
+        pose_track_df = pose_df[pose_df["track_id"] == track_id] if not pose_df.empty else pose_df
+        hand = pick_tracked_hand(pose_track_df) if not pose_track_df.empty else "left"
 
         df, lengths = detect_lengths(track_pos, min_swing_m)
         if not lengths:

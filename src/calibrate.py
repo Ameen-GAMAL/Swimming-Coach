@@ -167,17 +167,50 @@ def sample_swimmer_boxes(video_path, model, config):
 def estimate_length_scale(samples, pose_model, config, H_placeholder):
     """Estimates the correction factor that turns the placeholder length
     scale used to build H_placeholder into an approximate real one, from
-    the swimmer's own torso length (shoulder midpoint to hip midpoint).
+    the swimmer's DETECTION BOX length along the pool axis.
 
-    Uses a HIGHER keypoint confidence than pose.conf_threshold and a
-    minimum pixel-length sanity floor, because this single number scales
-    every downstream distance/speed measurement -- a handful of garbage
-    keypoint reads (e.g. shoulder and hip nearly coincident, a few pixels
-    apart) sneak past the general confidence threshold and, left in, throw
-    the whole estimate off by several times. A trimmed median (middle 60%)
-    over many samples is used rather than a plain median over few, since
-    even after filtering some noise gets through.
+    Measured from the box, not from pose keypoints (shoulder midpoint to
+    hip midpoint), because on this footage the keypoints collapse: a prone,
+    side-on, partly-submerged swimmer whose detection box spans ~1040px
+    produced a shoulder-to-hip reading of only ~60px, where the real torso
+    should be ~230px. That understated torso is what drove the whole
+    calibration ~4x long even after the clamp bug was removed. The box is
+    a far steadier signal -- the detector finds the swimmer in ~99% of
+    frames and the box visibly sits on the body.
+
+    The trade-off is honest and worth stating: a stroking swimmer's box
+    covers the body plus the forward arm reach, which varies through the
+    stroke cycle, so this is good to roughly +/-15-20%, not better. A
+    trimmed median (middle 60%) over many samples keeps stroke-phase
+    variation and the occasional bad box from dominating.
     """
+    cal_cfg = config["calibration"]
+    min_box_px = cal_cfg["scale_estimate_min_box_px"]
+    assumed_box_m = cal_cfg["assumed_swimmer_box_length_m"]
+    ratios = []
+
+    for frame_num, frame, box in samples:
+        x1, y1, x2, y2 = [float(v) for v in box]
+        if (x2 - x1) < min_box_px:
+            continue  # too small to be a real side-on swimmer at this range
+        y_mid = (y1 + y2) / 2
+        a = project_point(H_placeholder, x1, y_mid)
+        b = project_point(H_placeholder, x2, y_mid)
+        box_placeholder_units = np.hypot(b[0] - a[0], b[1] - a[1])
+        if box_placeholder_units > 1e-6:
+            ratios.append(assumed_box_m / box_placeholder_units)
+
+    if len(ratios) < cal_cfg["scale_estimate_min_samples"]:
+        return None, len(ratios)
+    ratios.sort()
+    trim = int(len(ratios) * 0.2)
+    trimmed = ratios[trim: len(ratios) - trim] if trim else ratios
+    return float(np.median(trimmed)), len(ratios)
+
+
+def _estimate_length_scale_from_torso(samples, pose_model, config, H_placeholder):
+    """Superseded by the box-based estimate above; kept only because it
+    documents the keypoint failure mode described there."""
     cal_cfg = config["calibration"]
     conf_threshold = cal_cfg["scale_estimate_min_keypoint_conf"]
     min_torso_px = cal_cfg["scale_estimate_min_torso_px"]
@@ -317,17 +350,46 @@ def calibrate_video(video_path, config, calibration_dir="data/calibration"):
             f"in config.yaml."
         )
 
-    # The raw anthropometric estimate can be wildly off (a handful of
-    # samples measured 3x too long on one clip during testing) -- but the
-    # pool's true length is a known, fixed constant (25m), so that knowledge
-    # is used as a strong prior and the noisy measurement is clamped to a
-    # plausible range around it, rather than trusted unconditionally.
-    clamp_min, clamp_max = config["calibration"]["length_scale_clamp_ratio"]
-    clamped_correction = float(np.clip(correction, clamp_min, clamp_max))
-    was_clamped = abs(clamped_correction - correction) > 1e-9
+    # The estimate is bounded by how much pool the camera can actually SEE,
+    # not by a ratio around the pool's full length.
+    #
+    # The old clamp (a ratio of pool_length_m, default [0.7, 1.6]) encoded
+    # the assumption that the detected rope span IS roughly the whole pool.
+    # That is false for this footage: the camera sits at water level a few
+    # metres from the near lane and sees only a short stretch. Measured on
+    # DIVE_P023, the clamp forced the visible span to 40m when the swimmer's
+    # own body implies well under 10m -- so the homography claimed each
+    # swimmer was 8.5-11.4m long, every distance was ~5.7x too large, and
+    # every speed ~5.7x too slow. The correct value sat a factor of 2.5
+    # outside the clamp, i.e. unreachable no matter what the estimator
+    # measured.
+    span_min_m, span_max_m = config["calibration"]["visible_span_bounds_m"]
+    raw_span_m = pool_length_m * correction
+    end_m = float(np.clip(raw_span_m, span_min_m, span_max_m))
+    was_clamped = abs(end_m - raw_span_m) > 1e-9
+    if was_clamped:
+        print(f"WARNING: estimated visible span {raw_span_m:.1f}m fell outside the plausible "
+              f"range [{span_min_m}, {span_max_m}]m and was clamped to {end_m:.1f}m -- treat "
+              f"this clip's distances as unreliable.")
 
-    start_m, end_m = 0.0, pool_length_m * clamped_correction
+    start_m = 0.0
     H = compute_homography(corners, start_m, end_m, lane_width_m)
+
+    # Sanity check against something physical, reported rather than hidden:
+    # a horizontal swimmer's detection box should come out around 2-3m.
+    box_lengths = []
+    for _, _, box in samples:
+        bx1, by1, bx2, by2 = [float(v) for v in box]
+        if (bx2 - bx1) < config["calibration"]["scale_estimate_min_box_px"]:
+            continue
+        y_mid = (by1 + by2) / 2
+        a = project_point(H, bx1, y_mid)
+        b = project_point(H, bx2, y_mid)
+        box_lengths.append(float(np.hypot(b[0] - a[0], b[1] - a[1])))
+    if box_lengths:
+        print(f"Visible pool span: {end_m:.1f}m over {len(box_lengths)} swimmer samples. "
+              f"Median box spans {np.median(box_lengths):.2f}m "
+              f"(target {config['calibration']['assumed_swimmer_box_length_m']}m).")
 
     water_lines = [{"lane": 1, "points": [corners[0], corners[3]]}]
     boundaries = [

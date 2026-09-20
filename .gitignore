@@ -2,7 +2,17 @@ data/raw/
 outputs/
 cache/
 mlruns/
+runs/
 *.pt
+
+# Fine-tuning experiment: manifest.json IS tracked -- it holds 240 frames of
+# hand review and cannot be reproduced without redoing that work. Everything
+# else here is regenerable from it plus the source videos
+# (sample_finetune_frames.py -> images/, prepare_yolo_dataset.py ->
+# yolo_dataset/, finetune_train.py -> runs/) and comes to ~1GB together.
+finetune_data/images/
+finetune_data/yolo_dataset/
+finetune_data/runs/
 __pycache__/
 *.pyc
 .venv/
