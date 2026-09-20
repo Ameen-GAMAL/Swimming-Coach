@@ -106,7 +106,18 @@ color_localize:
   # in the tested slice), which is fine for a signal meant to supplement
   # YOLO, not replace it -- the swimmer is only clearly visible (not
   # submerged) part of the time anyway.
-  enabled: true
+  #
+  # OFF as of the camera-motion fix. This was added to rescue a weak
+  # pretrained detector, but it synthesises a detection whenever the colour
+  # blob finds no overlapping YOLO box -- and a STATIC object matching the
+  # skin/cap thresholds then gets a synthetic detection every single frame.
+  # Being motionless, it never loses tracking, so it outranks the real
+  # swimmer: measured on DIVE_P023 it produced a 1576-frame "track" (every
+  # row scored exactly synthetic_confidence) of something that never moved,
+  # while the real swimmer's track fragmented around it. With the fine-tuned
+  # detector at ~99% hit rate the rescue is not needed, and turning this off
+  # also cut tracks-before-merge from 103 to 79 on the same clip.
+  enabled: false
   downscale_width: 1280           # frame is shrunk to about this width before HSV thresholding, for speed (measured: full-res ~71ms/frame vs ~8ms/frame at this size)
   search_top_frac: 0.35           # same idea as camera_motion.background_region_frac -- skip the sky/stands strip, never the pool
   search_bottom_margin_frac: 0.15 # also skip the nearest-camera water strip -- measured to carry the worst ripple/glint clutter
@@ -122,7 +133,7 @@ color_localize:
   synthetic_confidence: 0.5       # placeholder confidence given to a detection synthesized from the colour blob
 
 detection:
-  model: yolo11x.pt  # upgraded from yolo11m.pt (reliability pass, post-Phase 11): measured on 5 real frames across DIVE_P010, the largest pretrained variant found the swimmer in a frame where yolo11m and yolo11l found nothing at all, and averaged ~73% higher top confidence (0.31 vs 0.18) -- a free win, no new data or training needed, since it's the same pretrained COCO checkpoint family, just more capacity. See CLAUDE.md section 3 amendment.
+  model: yolo11x_swimmer_finetuned_v1.pt  # yolo11x fine-tuned on 196 hand-reviewed frames from 8 training clips. Measured on the 4 clips held out of training entirely (P010/P023/P007/P027): hit rate 66.2% -> 99.4%, mean confidence 0.219 -> 0.302, consistent across all four. Previously plain yolo11x.pt, itself an upgrade over yolo11m.pt. NOTE: *.pt is gitignored, so a fresh clone will not have this file -- rebuild it with scripts/finetune_train.py (then copy best.pt to this name at the project root), or set this back to yolo11x.pt to run on the pretrained detector.
   # Low on purpose: ByteTrack is designed to use low-confidence detections
   # for track recovery (its own track_high_thresh/track_low_thresh below do
   # that filtering), so this should sit at or below track_low_thresh, not
@@ -146,6 +157,7 @@ events:
   min_cycle_seconds: 0.6      # Anything faster than this is noise
   smoothing_window: 5         # Frames, to steady the wrist signal
   confidence_drop_window_frames: 15  # how many frames after a crossing to look for the confidence dip/rise that confirms it
+  crossing_hysteresis_frac: 0.15  # a crossing of the shoulder line only counts once the wrist travels this fraction of the signal's own 10-90 percentile spread clear of it. Scaled from the signal rather than fixed in pixels so it follows the swimmer through perspective; without it, keypoint jitter around the line produced about twice as many raw crossings as real strokes.
   max_sample_gap_frames: 15   # two pose samples further apart than this (0.125s at 120fps) are not treated as a crossing: pose emits no row when a crop yields no person, so consecutive ROWS can sit a second or more apart, and a flip across that gap was never observed -- only inferred from missing data
   min_track_frames_for_analysis: 60  # tracks shorter than this can't show even one full stroke cycle -- skip rather than produce a near-empty plot
 

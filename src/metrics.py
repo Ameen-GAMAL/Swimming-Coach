@@ -297,6 +297,40 @@ def config_clean_distance(length_row):
     return length_row["average_speed_ms"] * length_row["clean_swim_time_sec"]
 
 
+def summarise_track_cycles(track_events, pose_track_df, hand):
+    """Cycle count, stroke rate and cycle-time variability over a whole
+    track. Time-only, so it carries none of the distance scale's error."""
+    if track_events.empty:
+        return None
+    ev = track_events.sort_values("time_sec")
+    entries = ev[ev["event_type"] == "entry"].reset_index(drop=True)
+    exits = ev[ev["event_type"] == "exit"].reset_index(drop=True)
+    cycle_times, confs = [], []
+    for i in range(len(entries) - 1):
+        lo, hi = entries.iloc[i], entries.iloc[i + 1]
+        between = exits[(exits["time_sec"] > lo["time_sec"]) & (exits["time_sec"] < hi["time_sec"])]
+        if between.empty:
+            continue  # unpaired -- occluded, or the stroke straddles a tracking gap
+        cycle_times.append(float(hi["time_sec"] - lo["time_sec"]))
+        c = cycle_mean_confidence(pose_track_df, hand, lo["frame"], hi["frame"])
+        if c is not None:
+            confs.append(c)
+    if not cycle_times:
+        return None
+    total = float(np.sum(cycle_times))
+    return {
+        "cycle_count": len(cycle_times),
+        "clean_swim_time_sec": total,
+        "stroke_rate_cpm": (len(cycle_times) / total * 60) if total > 0 else None,
+        "cycle_time_cv_pct": (float(np.std(cycle_times) / np.mean(cycle_times) * 100)
+                               if len(cycle_times) >= 2 else None),
+        "mean_wrist_confidence": float(np.mean(confs)) if confs else None,
+        "rejection_reason": "",
+        "data_quality_note": "stroke timing over the whole tracked window (time-based, "
+                              "independent of the distance scale); distance-derived figures omitted",
+    }
+
+
 def run_metrics(video_path, config, calibration_dir="data/calibration"):
     tracks_df, _ = run_detect_track_cached(video_path, config, calibration_dir)
     events_df, _ = run_events_cached(video_path, config, calibration_dir)
@@ -340,6 +374,22 @@ def run_metrics(video_path, config, calibration_dir="data/calibration"):
                 lap = add_benchmark_comparisons(lap, config)
             lap.update({"video": os.path.basename(video_path), "track_id": track_id, "row_type": "lap"})
             length_rows.append(lap)
+
+        # Per-track stroke timing, measured over the whole tracked window
+        # instead of inside a clean-zone length.
+        #
+        # Stroke rate and cycle-time variability need only TIME, which the
+        # 120fps timestamps give exactly -- unlike every distance-derived
+        # number here, which inherits the unresolved scale problem. Gating
+        # them on the clean zone throws away good data for a bad reason:
+        # measured on DIVE_P023, 41 detected entries collapsed to a single
+        # counted cycle purely because the spurious "lengths" each covered
+        # 0.1-1.8m of the 15m zone.
+        track_row = summarise_track_cycles(track_events, pose_track_df, hand)
+        if track_row:
+            track_row.update({"video": os.path.basename(video_path), "track_id": track_id,
+                               "row_type": "track"})
+            length_rows.append(track_row)
 
         rows.extend(length_rows)
 

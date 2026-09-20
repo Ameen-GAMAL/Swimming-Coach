@@ -135,13 +135,17 @@ def diagnostics_summary_md(detect_diag, pose_diag, events_diag, metrics_diag):
 
 
 def build_cycle_chart(metrics_df):
-    if metrics_df.empty:
+    # Charts the per-track stroke timing rather than per-length figures.
+    # Stroke rate is derived from timestamps alone, so it survives the
+    # unresolved distance-scale problem that leaves every per-length
+    # stroke_rate_cpm/distance_per_cycle_m blank.
+    if metrics_df.empty or "row_type" not in metrics_df:
         return None
-    accepted = metrics_df[(metrics_df["row_type"] == "length") & (metrics_df["rejection_reason"] == "")]
-    if accepted.empty:
+    tracks = metrics_df[(metrics_df["row_type"] == "track") & metrics_df["stroke_rate_cpm"].notna()]
+    if tracks.empty:
         return None
-    chart_df = accepted[["length_index", "stroke_rate_cpm", "distance_per_cycle_m"]].melt(
-        id_vars="length_index", var_name="metric", value_name="value")
+    chart_df = tracks[["track_id", "stroke_rate_cpm", "cycle_count"]].melt(
+        id_vars="track_id", var_name="metric", value_name="value")
     return chart_df
 
 
@@ -258,10 +262,10 @@ with gr.Blocks(title="Swimming Performance Tracking (POC)") as demo:
                 video_out = gr.Video(label="Annotated video")
                 with gr.Column():
                     chart_out = gr.BarPlot(
-                        x="length_index", y="value", color="metric",
-                        title="Stroke rate / distance-per-cycle by length (accepted lengths only)",
-                        x_title="Length index", y_title="Value", height=280)
-            table_out = gr.Dataframe(label="Results (per length and per lap)",
+                        x="track_id", y="value", color="metric",
+                        title="Stroke rate (cycles/min) and cycle count, per tracked swimmer",
+                        x_title="Track", y_title="Value", height=280)
+            table_out = gr.Dataframe(label="Results (per length, per lap, and per track)",
                                       value=pd.DataFrame([{"note": "Run an analysis to see results here."}]))
 
         with gr.Tab("Diagnostics"):

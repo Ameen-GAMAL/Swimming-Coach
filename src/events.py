@@ -67,34 +67,62 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
     ref_x = df[f"{hand}_wrist_ref_x"]
     conf = df[f"{hand}_wrist_conf"]
 
-    water_y = ref_x.apply(lambda x: water_line_y_at_x(water_line_points, x))
-    # Smaller y = higher in the image = above the water surface (hand in the air)
-    above = (ref_y < water_y).to_numpy()
+    # The reference is the swimmer's own SHOULDER LINE, not the calibrated
+    # water line.
+    #
+    # The water line cannot work on this footage. calibrate.py derives it
+    # from the detected lane rope, which is the FAR edge of the water, but
+    # the camera sits at water level so nearer water projects lower in the
+    # image -- the swimmer's own local surface is at their own image row.
+    # Measured on DIVE_P023: the water line sat at ref_y ~1355 while every
+    # wrist sample sat at ~1500, below it by 15-281px, giving exactly ZERO
+    # above/below crossings in 3962 samples and therefore zero cycles.
+    #
+    # Shoulder-relative is immune to that: it needs no calibration, follows
+    # the swimmer through perspective automatically, and tracks the thing
+    # actually being counted -- the arm rising into recovery and dropping
+    # into the catch. On the same data it gives 398 crossings. "entry" and
+    # "exit" below therefore mean the hand dropping below / rising above the
+    # shoulder line, which is a proxy for water entry, not a measurement of
+    # it.
+    shoulder_y = df[["left_shoulder_ref_y", "right_shoulder_ref_y"]].mean(axis=1)
+    shoulder_y = shoulder_y.rolling(ev_cfg["smoothing_window"], center=True, min_periods=1).mean()
+    signal = (ref_y - shoulder_y)            # negative = wrist above the shoulder
+    above = (signal < 0).to_numpy()
     # Tri-state, not a plain boolean. pose.py emits no row at all when a
     # crop yields no person, and leaves ref_x/ref_y NaN when the frame's
-    # camera-motion transform wasn't trusted -- and `NaN < water_y` is
-    # False, which the bare boolean read as "the hand is underwater". Every
-    # gap in pose coverage therefore looked like a submerged hand and
-    # manufactured transitions out of missing data.
-    known = (ref_y.notna() & water_y.notna()).to_numpy()
+    # camera-motion transform wasn't trusted -- and `NaN < 0` is False,
+    # which the bare boolean read as "the hand is down". Every gap in pose
+    # coverage therefore manufactured transitions out of missing data.
+    known = (ref_y.notna() & shoulder_y.notna()).to_numpy()
 
     frames = df["frame"].to_numpy()
-    conf_arr = conf.to_numpy(dtype=float)
+    sig = signal.to_numpy(dtype=float)
     min_cycle_frames = ev_cfg["min_cycle_seconds"] * fps
-    drop_window = ev_cfg["confidence_drop_window_frames"]
     max_sample_gap = ev_cfg["max_sample_gap_frames"]
-    wrist_conf_threshold = ev_cfg["wrist_conf_threshold"]
 
-    def confirmed(i, want_drop):
-        # Windowed by FRAME NUMBER, not by row count: with frames missing
-        # from pose, a fixed number of rows can span several times the
-        # intended window.
-        sel = (frames >= frames[i]) & (frames <= frames[i] + drop_window)
-        window = conf_arr[sel]
-        window = window[~np.isnan(window)]
-        if window.size == 0:
+    # Hysteresis band, scaled from the signal's own spread rather than a
+    # fixed pixel count, so it follows the swimmer through perspective
+    # instead of needing a per-clip constant. Without it, keypoint jitter
+    # around the shoulder line produces a burst of crossings for one real
+    # stroke (measured: ~2x too many raw flips on this footage).
+    finite = sig[np.isfinite(sig)]
+    if finite.size < 4:
+        return [], pd.DataFrame({"frame": df["frame"], "time_sec": df["time_sec"],
+                                  "wrist_ref_y_smoothed": ref_y, "water_line_y": shoulder_y,
+                                  "wrist_conf": conf})
+    amplitude = float(np.percentile(finite, 90) - np.percentile(finite, 10))
+    band = ev_cfg["crossing_hysteresis_frac"] * amplitude
+
+    def excursion_confirms(i, going_down):
+        """Require the signal to actually travel clear of the band, not just
+        graze the line -- looks ahead over one minimum cycle."""
+        sel = (frames >= frames[i]) & (frames <= frames[i] + min_cycle_frames)
+        w = sig[sel]
+        w = w[np.isfinite(w)]
+        if w.size == 0:
             return False
-        return (window.min() < wrist_conf_threshold) if want_drop else (window.max() >= wrist_conf_threshold)
+        return (w.max() >= band) if going_down else (w.min() <= -band)
 
     # A state machine, not independent per-crossing detection: the hand can
     # only exit after it has entered, and can't enter again until it has
@@ -125,12 +153,12 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
         if not underwater and above[i - 1] and not above[i]:
             if last_entry_frame is not None and (frame_num - last_entry_frame) < min_cycle_frames:
                 continue  # periodicity signal: too soon to be a real new cycle
-            if confirmed(i, want_drop=True):
+            if excursion_confirms(i, going_down=True):
                 accepted.append(("entry", i))
                 underwater = True
                 last_entry_frame = frame_num
         elif underwater and not above[i - 1] and above[i]:
-            if confirmed(i, want_drop=False):
+            if excursion_confirms(i, going_down=False):
                 accepted.append(("exit", i))
                 underwater = False
 
@@ -150,7 +178,7 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
 
     signal = pd.DataFrame({
         "frame": df["frame"], "time_sec": df["time_sec"],
-        "wrist_ref_y_smoothed": ref_y, "water_line_y": water_y, "wrist_conf": conf,
+        "wrist_ref_y_smoothed": ref_y, "water_line_y": shoulder_y, "wrist_conf": conf,
     })
     return events, signal
 
@@ -162,7 +190,7 @@ def save_wrist_signal_plot(signal, events, video_path, track_id, hand, out_dir="
 
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(signal["time_sec"], signal["wrist_ref_y_smoothed"], label=f"{hand} wrist height (smoothed)", color="tab:blue")
-    ax.plot(signal["time_sec"], signal["water_line_y"], label="water line", color="tab:cyan", linestyle="--")
+    ax.plot(signal["time_sec"], signal["water_line_y"], label="shoulder line (reference)", color="tab:cyan", linestyle="--")
     ax.invert_yaxis()  # smaller y is higher in the frame -- flip so "up" reads as up
 
     for ev in events:
