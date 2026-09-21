@@ -308,6 +308,20 @@ and 30fps — see `render.output_max_width`/`output_fps` in config.yaml —
 since this machine's OpenCV has no H.264 encoder and the fallback codec
 produces huge files at full source resolution/framerate).
 
+### Coach report
+
+```
+.venv\Scripts\python.exe -m src.report data\raw\<video-file>.MP4
+```
+
+Builds `outputs/<video>_report.docx` — a Word document written for the
+coach: stroke tempo, rhythm consistency, pacing across the swim, a tempo
+chart, three frames from the annotated video, and observations generated
+from the measured numbers. Deliberately leaves out diagnostics and every
+distance/speed figure (see CLAUDE.md section 8.10). Opens in Word or
+LibreOffice; export to PDF from there. The web page builds this at the end
+of every run and offers it for download in the Results tab.
+
 ### Manual review
 
 ```
@@ -327,8 +341,10 @@ Target: around 200 events across 3-4 videos (CLAUDE.md section 13).
 
 Opens a Gradio page at `http://127.0.0.1:7860`. Upload a video or pick one
 from `data/raw/`, click "Run analysis", and it runs the whole pipeline
-(calibrating first if needed) then shows the annotated video and results
-table. Takes several minutes depending on video length.
+(calibrating first if needed) then shows the annotated video, the results
+table, and a download link for the coach report. Takes several minutes
+depending on video length; a repeat run of the same video is near-instant
+since every stage is cached.
 
 ## MLflow
 

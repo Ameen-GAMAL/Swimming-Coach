@@ -19,6 +19,7 @@ from src.metrics import run_metrics_cached
 from src.pose import run_pose_cached
 from src.profiling import load_config
 from src.render import render_video
+from src.report import build_report, summarise_run
 
 CONFIG = load_config("config.yaml")
 
@@ -29,6 +30,7 @@ STAGES = [
     "Detecting hand-entry events",
     "Computing metrics",
     "Rendering the annotated video",
+    "Building the coach report",
 ]
 
 
@@ -87,50 +89,42 @@ def styled_callout(kind, title, body):
     )
 
 
-def results_summary_md(detect_diag, events_diag, metrics_diag):
+def results_summary_md(s):
     # The honest headline, before the detail table -- how much of the
-    # video is actually usable data, not just what got accepted.
-    def get(d, key, default=None):
-        return d.get(key, default) if d else default
-
-    longest_sec = get(detect_diag, "detect_longest_track_sec")
-    longest_frames = get(detect_diag, "detect_longest_track_frames")
-    entries = get(events_diag, "event_entries_detected")
-    lengths_ok = get(metrics_diag, "result_lengths_accepted", 0)
-    lengths_total = get(metrics_diag, "result_lengths_computed", 0)
-
-    longest_line = (f"Longest continuously-tracked segment: **{longest_sec:.1f}s** ({longest_frames} frames)"
-                    if longest_sec is not None else "Longest continuously-tracked segment: n/a (cached result)")
-    entries_line = (f"Real hand-entries detected: **{entries}**" if entries is not None
-                    else "Real hand-entries detected: n/a (cached result)")
-
-    return (f"**Summary** -- {longest_line} · {entries_line} · "
-            f"Lengths accepted: **{lengths_ok} / {lengths_total}**")
+    # video is actually usable data, not just what got accepted. Reads
+    # from summarise_run(), which derives every count from the cached
+    # stage outputs, so a cached run shows the same numbers as a fresh one
+    # (previously the cached path had no counts and printed "n/a").
+    tempo = (f"{s['median_cpm_multi']:.0f} cycles/min" if s["median_cpm_multi"] is not None
+             else (f"{s['median_cpm']:.0f} cycles/min (single-cycle segments only)" if s["median_cpm"] is not None
+                   else "not measurable"))
+    return (f"**Summary** -- Swimmer in view: **{s['coverage_pct']:.0f}%** of frames · "
+            f"Longest continuously-tracked segment: **{s['longest_track_sec']:.1f}s** ({s['longest_track_frames']} frames) · "
+            f"Stroke cycles timed: **{s['cycles_total']}** · Median stroke tempo: **{tempo}** · "
+            f"Lengths accepted: **{s['lengths_accepted']} / {s['lengths_computed']}**")
 
 
-def diagnostics_summary_md(detect_diag, pose_diag, events_diag, metrics_diag):
-    def get(d, key, default="n/a (cached result -- see CSV for full data)"):
-        return d.get(key, default) if d else default
-
+def diagnostics_summary_md(s):
     return f"""
 ### Detection & tracking
-- Frames processed: {get(detect_diag, 'detect_frames_total')}
-- Tracks found (after lane merge): {get(detect_diag, 'detect_tracks_found')}
-- Colour-based detections added: {get(detect_diag, 'color_blob_synthesized')}
+- Frames in clip: {s['frames_total']:,} at {s['fps']:.2f} fps
+- Frames with a detection: {s['frames_detected']:,} ({s['coverage_pct']:.1f}%)
+- Tracks found (after merge): {s['tracks']} -- longest {s['longest_track_frames']} frames ({s['longest_track_sec']:.1f}s)
 
 ### Pose
-- Wrist visibility: {pose_diag.get('quality_wrist_visible_pct', 0):.1f}% (gate: ≥70%)
-- Frames with a valid pose reading: {get(pose_diag, 'pose_frames_processed')} / {get(pose_diag, 'pose_frames_available')}
+- Wrist visibility: {s['wrist_visible_pct']:.1f}% of attempted detections (gate: ≥70%)
+- Pose readings produced: {s['pose_rows']:,}
 
-### Events
-- Entries detected: {get(events_diag, 'event_entries_detected')}
-- Exits detected: {get(events_diag, 'event_exits_detected')}
-- Tracks too short to analyse: {get(events_diag, 'event_tracks_skipped_too_short')}
+### Stroke events
+- Entries detected: {s['entries']}
+- Exits detected: {s['exits']}
+- Cycles timed: {s['cycles_total']} across {s['tracks_with_cycles']} tracks ({s['tracks_with_two_plus_cycles']} with 2+ cycles)
 
 ### Metrics / quality gate
-- Lengths computed: {get(metrics_diag, 'result_lengths_computed')}
-- Lengths accepted (passed the quality gate): {get(metrics_diag, 'result_lengths_accepted')}
-- Laps computed: {get(metrics_diag, 'result_laps_computed')}
+- Lengths computed: {s['lengths_computed']}
+- Lengths accepted (passed the quality gate): {s['lengths_accepted']}
+- Laps computed: {s['laps_computed']}
+- Length scale: {s['scale_method']}, visible span {s['visible_span_m']:.1f} m{' (clamped)' if s['scale_clamped'] else ''}
 """
 
 
@@ -152,7 +146,11 @@ def build_cycle_chart(metrics_df):
 def run_pipeline(uploaded_file, picked_video, progress=gr.Progress()):
     n = len(STAGES)
     empty_table = pd.DataFrame([{"note": "Run an analysis to see results here."}])
-    NUM_OUTPUTS = 9
+    # Output order, matched by run_button.click below:
+    #   0 stage_status  1 summary_md  2 callout  3 video  4 table
+    #   5 chart         6 wrist gallery  7 calibration preview  8 diagnostics md  9 report file
+    NUM_OUTPUTS = 10
+    failed_tail = (None, empty_table, None, None, None, "", None)
 
     if uploaded_file is not None:
         video_path = os.path.join("data", "raw", os.path.basename(uploaded_file))
@@ -162,8 +160,8 @@ def run_pipeline(uploaded_file, picked_video, progress=gr.Progress()):
         video_path = os.path.join("data", "raw", picked_video)
     else:
         yield (render_stage_status(0, n, "Upload a video or pick one from data/raw/ first."),
-               "", styled_callout("warning", "No video selected", "Upload a file or choose one from the dropdown."),
-               None, empty_table, None, None, None, "")
+               "", styled_callout("warning", "No video selected", "Upload a file or choose one from the dropdown.")
+               ) + failed_tail
         return
 
     try:
@@ -174,29 +172,33 @@ def run_pipeline(uploaded_file, picked_video, progress=gr.Progress()):
         calib_preview = preview_path(video_path) if os.path.exists(preview_path(video_path)) else None
 
         progress(0.15)
-        yield (render_stage_status(1, n),) + (gr.skip(),) * 6 + (calib_preview,) + (gr.skip(),) * 1
-        _, detect_diag = run_detect_track_cached(video_path, CONFIG)
+        yield (render_stage_status(1, n),) + (gr.skip(),) * 6 + (calib_preview,) + (gr.skip(),) * 2
+        run_detect_track_cached(video_path, CONFIG)
 
-        progress(0.45)
+        progress(0.4)
         yield (render_stage_status(2, n),) + (gr.skip(),) * (NUM_OUTPUTS - 1)
-        _, pose_diag = run_pose_cached(video_path, CONFIG)
+        run_pose_cached(video_path, CONFIG)
 
-        progress(0.7)
+        progress(0.65)
         yield (render_stage_status(3, n),) + (gr.skip(),) * (NUM_OUTPUTS - 1)
-        _, events_diag = run_events_cached(video_path, CONFIG)
+        run_events_cached(video_path, CONFIG)
 
-        progress(0.85)
+        progress(0.8)
         yield (render_stage_status(4, n),) + (gr.skip(),) * (NUM_OUTPUTS - 1)
-        metrics_df, metrics_diag = run_metrics_cached(video_path, CONFIG)
+        metrics_df, _ = run_metrics_cached(video_path, CONFIG)
 
-        progress(0.95)
+        progress(0.88)
         yield (render_stage_status(5, n),) + (gr.skip(),) * (NUM_OUTPUTS - 1)
         annotated_path = render_video(video_path, CONFIG)
 
+        progress(0.97)
+        yield (render_stage_status(6, n),) + (gr.skip(),) * (NUM_OUTPUTS - 1)
+        report_path = build_report(video_path, CONFIG)
+        summary = summarise_run(video_path, CONFIG)
+
     except Exception as exc:
         yield (render_stage_status(n, n, str(exc)),
-               "", styled_callout("warning", "Analysis failed", str(exc)),
-               None, empty_table, None, None, None, "")
+               "", styled_callout("warning", "Analysis failed", str(exc))) + failed_tail
         return
 
     accepted_any = not metrics_df.empty and (metrics_df["rejection_reason"] == "").any()
@@ -215,7 +217,7 @@ def run_pipeline(uploaded_file, picked_video, progress=gr.Progress()):
             "zone or have no stroke-cycle data -- check each row's data_quality_note before quoting "
             "a number. Benchmark comparisons use placeholder ranges, not real professional-swimmer data.")
 
-    summary_md = results_summary_md(detect_diag, events_diag, metrics_diag)
+    summary_md = results_summary_md(summary)
     display_df = metrics_df if not metrics_df.empty else pd.DataFrame(
         [{"note": "No lengths were detected for this video -- see the Diagnostics tab."}])
 
@@ -224,11 +226,11 @@ def run_pipeline(uploaded_file, picked_video, progress=gr.Progress()):
         if f.startswith(os.path.splitext(os.path.basename(video_path))[0]) and f.endswith("_wrist_signal.png")
     ) if os.path.isdir("outputs") else []
 
-    diag_md = diagnostics_summary_md(detect_diag, pose_diag, events_diag, metrics_diag)
+    diag_md = diagnostics_summary_md(summary)
     chart_df = build_cycle_chart(metrics_df)
 
     yield (render_stage_status(n, n), summary_md, callout, annotated_path, display_df,
-           chart_df, wrist_plots, calib_preview, diag_md)
+           chart_df, wrist_plots, calib_preview, diag_md, report_path)
 
 
 THEME = gr.themes.Soft(primary_hue="cyan", secondary_hue="blue")
@@ -258,6 +260,9 @@ with gr.Blocks(title="Swimming Performance Tracking (POC)") as demo:
         with gr.Tab("Results"):
             summary_md_out = gr.Markdown()
             callout_box = gr.HTML()
+            report_out = gr.File(label="Coach report (.docx) -- tempo, rhythm, pacing and observations; "
+                                       "opens in Word or LibreOffice, export to PDF from there",
+                                 interactive=False)
             with gr.Row():
                 video_out = gr.Video(label="Annotated video")
                 with gr.Column():
@@ -314,7 +319,7 @@ above.
     run_button.click(
         run_pipeline, inputs=[upload, picker],
         outputs=[stage_status, summary_md_out, callout_box, video_out, table_out, chart_out,
-                 wrist_gallery_out, calib_preview_out, diag_md_out])
+                 wrist_gallery_out, calib_preview_out, diag_md_out, report_out])
 
 
 if __name__ == "__main__":

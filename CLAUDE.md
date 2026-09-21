@@ -225,13 +225,14 @@ swimming-poc/
 │   ├── events.py          Find hand entry and exit moments
 │   ├── metrics.py         Turn events into measurements
 │   ├── render.py          Draw the annotated output video
+│   ├── report.py          Build the downloadable coach report (added -- see section 8.10)
 │   ├── profiling.py       Time each stage, send results to MLflow
 │   └── review.py          Manual review tool (added -- see section 13 amendment)
 ├── cache/                 Intermediate results, so reruns are fast
-└── outputs/               Final CSV and annotated video
+└── outputs/               Final CSV, annotated video, and the coach report
 ```
 
-Eight source files, plus `review.py` added per the section 13 amendment.
+Eight source files, plus `review.py` (section 13 amendment) and `report.py` (section 8.10).
 Each one does a single job. If a file starts doing two jobs, stop and ask
 before splitting it.
 
@@ -608,6 +609,37 @@ Produce an annotated video showing:
 
 The grid is what lets the client confirm the distance maths with their own
 eyes. Make it clearly visible without hiding the swimmers.
+
+### 8.10 The coach report (`src/report.py`) — added by user request
+
+A downloadable Word document (`outputs/<video>_report.docx`) built at the
+end of every run and offered in the app's Results tab. It is written for
+the coach, not the engineer: no diagnostics, no system caveats, no
+distance or speed figures.
+
+What it contains, and why only this:
+- **Stroke tempo** (cycles/min), **rhythm consistency** (cycle-time
+  variation), and **pacing** (tempo change from the earliest to the latest
+  tracked segment) — all derived from the video's timestamps alone, so
+  they carry none of the distance-scale error.
+- A tempo-through-the-swim chart, a per-segment table, and three frames
+  from the annotated video.
+- **Observations** generated from those numbers, phrased as what was
+  measured and what is worth checking on the video — never as a
+  prescription. The coach's own reading of technique takes precedence and
+  the report says so.
+- Reference tempo ranges come from `benchmarks.freestyle` and are labelled
+  as general reference ranges, since those values are placeholders.
+
+Deliberately excluded: the pull/recovery phase split. The events data
+carries entry→exit pairs as close as 30–50 ms apart (jitter around the
+shoulder line), and the minimum-cycle rule guards only entry-to-entry
+spacing, so a within-cycle phase split would be built on noise. Add it
+only once entry→exit spacing has its own guard.
+
+`summarise_run()` in the same module derives every count from the cached
+stage outputs; the app's summary line and Diagnostics tab read from it
+too, which is what stopped cached runs from showing "n/a" everywhere.
 
 ---
 
