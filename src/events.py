@@ -1,13 +1,10 @@
-# Finds hand-entry and hand-exit moments for each tracked swimmer.
-#
-# Tracks one wrist per swimmer -- whichever one is detected more
-# confidently on average, since with a side view the far arm is
-# periodically hidden behind the body and only one hand can be tracked
-# reliably. Detects a crossing using three signals together, not one:
-# the wrist crossing the lane's water line, a confidence drop (entry) or
-# rise (exit) right after -- confirming the hand actually went under or
-# came back up -- and a minimum spacing between entries so noise isn't
-# counted as a stroke.
+# Finds each tracked swimmer's strokes: one "peak" event per arm recovery
+# (the hand at its highest above the swimmer's own shoulder line), plus
+# the "exit" and "entry" crossings of that line on either side of it where
+# they were actually observed. Uses the better-tracked wrist channel only
+# -- the pose model's left/right labels follow whichever arm is visible,
+# so the two channels carry the same strokes. See detect_events_for_track
+# for why peaks rather than line crossings, and CLAUDE.md section 8.3.
 
 import argparse
 import hashlib
@@ -59,113 +56,125 @@ def pick_tracked_hand(track_df):
 
 
 def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
+    """Strokes for one track, anchored on the RECOVERY PEAK -- the moment the
+    hand is highest above the swimmer's own shoulder line.
+
+    Why peaks, and why the shoulder line: on this footage the hand in the
+    air is the one thing the pose model tracks well (high confidence, a
+    large excursion above the shoulder), while the underwater pull is where
+    the wrist is lost or guessed. Line-crossing detection therefore kept
+    firing on the underwater guesses -- measured: 23 of 30 entry-to-exit
+    intervals under 0.2s, and a "pull" shorter than the "recovery", the
+    reverse of a real stroke -- and every fix that anchored on crossings
+    traded false strokes for missed ones. A recovery peak is unambiguous:
+    it is found with a prominence test on confident samples only, and the
+    line crossings on either side of it are then read off as that stroke's
+    exit (hand rising through the line) and entry (hand dropping through
+    it), each only when actually observed.
+
+    The calibrated water line is not used at all: calibrate.py derives it
+    from the far lane rope, but the camera sits at water level so nearer
+    water projects lower in the image -- measured on DIVE_P023 every wrist
+    sample sat 15-281px below that line, giving zero crossings.
+
+    One more thing the peaks reveal, measured on real footage: consecutive
+    peaks alternate large / small at exactly half the arm-cycle period, and
+    the model's "left" and "right" wrist channels show the same pattern at
+    the same times. The model labels whichever arm is visible, not the
+    anatomical side -- so consecutive peaks are ALTERNATE arms, each peak
+    is one arm stroke, and the camera-side arm is the one that rises
+    higher in the image. Peaks are classified near/far by height when the
+    two groups separate clearly; a left/right split by label would be
+    fiction.
+    """
+    from scipy.signal import find_peaks
+
     ev_cfg = config["events"]
     df = track_df.sort_values("frame").reset_index(drop=True)
+    win = ev_cfg["smoothing_window"]
 
-    ref_y_raw = df[f"{hand}_wrist_ref_y"]
-    ref_y = ref_y_raw.rolling(ev_cfg["smoothing_window"], center=True, min_periods=1).mean()
+    ref_y = df[f"{hand}_wrist_ref_y"].rolling(win, center=True, min_periods=1).mean()
     ref_x = df[f"{hand}_wrist_ref_x"]
     conf = df[f"{hand}_wrist_conf"]
-
-    # The reference is the swimmer's own SHOULDER LINE, not the calibrated
-    # water line.
-    #
-    # The water line cannot work on this footage. calibrate.py derives it
-    # from the detected lane rope, which is the FAR edge of the water, but
-    # the camera sits at water level so nearer water projects lower in the
-    # image -- the swimmer's own local surface is at their own image row.
-    # Measured on DIVE_P023: the water line sat at ref_y ~1355 while every
-    # wrist sample sat at ~1500, below it by 15-281px, giving exactly ZERO
-    # above/below crossings in 3962 samples and therefore zero cycles.
-    #
-    # Shoulder-relative is immune to that: it needs no calibration, follows
-    # the swimmer through perspective automatically, and tracks the thing
-    # actually being counted -- the arm rising into recovery and dropping
-    # into the catch. On the same data it gives 398 crossings. "entry" and
-    # "exit" below therefore mean the hand dropping below / rising above the
-    # shoulder line, which is a proxy for water entry, not a measurement of
-    # it.
     shoulder_y = df[["left_shoulder_ref_y", "right_shoulder_ref_y"]].mean(axis=1)
-    shoulder_y = shoulder_y.rolling(ev_cfg["smoothing_window"], center=True, min_periods=1).mean()
-    signal = (ref_y - shoulder_y)            # negative = wrist above the shoulder
-    above = (signal < 0).to_numpy()
-    # Tri-state, not a plain boolean. pose.py emits no row at all when a
-    # crop yields no person, and leaves ref_x/ref_y NaN when the frame's
-    # camera-motion transform wasn't trusted -- and `NaN < 0` is False,
-    # which the bare boolean read as "the hand is down". Every gap in pose
-    # coverage therefore manufactured transitions out of missing data.
-    known = (ref_y.notna() & shoulder_y.notna()).to_numpy()
+    shoulder_y = shoulder_y.rolling(win, center=True, min_periods=1).mean()
+    signal = ref_y - shoulder_y              # negative = wrist above the shoulder line
+    # A sample counts only when the wrist was read with some confidence:
+    # a low-confidence wrist is the model guessing at a hand that has gone
+    # under (measured: confidence 0.1-0.3 right after entry, position
+    # wobbling +/-20px around the line).
+    known = (ref_y.notna() & shoulder_y.notna() & (conf >= ev_cfg["wrist_conf_threshold"])).to_numpy()
 
-    frames = df["frame"].to_numpy()
-    sig = signal.to_numpy(dtype=float)
-    min_cycle_frames = ev_cfg["min_cycle_seconds"] * fps
-    max_sample_gap = ev_cfg["max_sample_gap_frames"]
+    plot = pd.DataFrame({"frame": df["frame"], "time_sec": df["time_sec"],
+                         "wrist_ref_y_smoothed": ref_y, "water_line_y": shoulder_y, "wrist_conf": conf})
+    idx = np.flatnonzero(known)
+    if idx.size < 6:
+        return [], plot
+    t = df["time_sec"].to_numpy(dtype=float)[idx]
+    s = signal.to_numpy(dtype=float)[idx]
+    frames = df["frame"].to_numpy()[idx]
+    height = -s                              # recovery peaks are maxima of this
 
-    # Hysteresis band, scaled from the signal's own spread rather than a
-    # fixed pixel count, so it follows the swimmer through perspective
-    # instead of needing a per-clip constant. Without it, keypoint jitter
-    # around the shoulder line produces a burst of crossings for one real
-    # stroke (measured: ~2x too many raw flips on this footage).
-    finite = sig[np.isfinite(sig)]
-    if finite.size < 4:
-        return [], pd.DataFrame({"frame": df["frame"], "time_sec": df["time_sec"],
-                                  "wrist_ref_y_smoothed": ref_y, "water_line_y": shoulder_y,
-                                  "wrist_conf": conf})
-    amplitude = float(np.percentile(finite, 90) - np.percentile(finite, 10))
-    band = ev_cfg["crossing_hysteresis_frac"] * amplitude
+    # Scale from the signal's own swing so it follows the swimmer through
+    # perspective. band is the minimum height a recovery must reach above
+    # the line, and the minimum prominence a peak needs.
+    swing = float(np.percentile(s, 95) - np.percentile(s, 5))
+    band = ev_cfg["crossing_hysteresis_frac"] * swing
+    if swing <= 0:
+        return [], plot
 
-    def excursion_confirms(i, going_down):
-        """Require the signal to actually travel clear of the band, not just
-        graze the line -- looks ahead over one minimum cycle."""
-        sel = (frames >= frames[i]) & (frames <= frames[i] + min_cycle_frames)
-        w = sig[sel]
-        w = w[np.isfinite(w)]
-        if w.size == 0:
-            return False
-        return (w.max() >= band) if going_down else (w.min() <= -band)
+    # Peaks on the confident-sample sequence, then a minimum time separation
+    # enforced greedily by prominence (samples are irregular in time, so
+    # find_peaks' own distance argument -- in samples -- would be wrong).
+    pk, props = find_peaks(height, height=band, prominence=band)
+    order = np.argsort(-props["prominences"]) if pk.size else np.array([], dtype=int)
+    kept = []
+    min_sep = ev_cfg["min_stroke_seconds"]
+    for k in order:
+        if all(abs(t[pk[k]] - t[j]) >= min_sep for j in kept):
+            kept.append(pk[k])
+    kept.sort()
+    if not kept:
+        return [], plot
 
-    # A state machine, not independent per-crossing detection: the hand can
-    # only exit after it has entered, and can't enter again until it has
-    # exited. Without this, jitter in the smoothed signal right at the
-    # water line produces a burst of spurious exits for one real entry
-    # (measured: 31 exits vs 8 entries before this fix, when they should
-    # roughly pair up).
-    # Initialized from the observed first sample, not hardcoded to "starts
-    # surfaced" -- a track almost never happens to begin exactly at a real
-    # entry/exit boundary, so it can just as easily start already
-    # submerged. Measured: with a hardcoded False start, a track beginning
-    # mid-underwater had its first (and sometimes only) real transition
-    # silently discarded, since an "exit" can only register once
-    # `underwater` is True.
-    accepted = []
-    underwater = (not above[int(np.argmax(known))]) if known.any() else False
-    last_entry_frame = None
-    for i in range(1, len(df)):
-        # Both sides of a crossing have to be actually observed, and have to
-        # be adjacent in TIME rather than merely adjacent rows -- pose drops
-        # frames, so consecutive rows can sit a second apart, and any flip
-        # across that gap was never seen, only inferred.
-        if not (known[i] and known[i - 1]):
-            continue
-        if frames[i] - frames[i - 1] > max_sample_gap:
-            continue
-        frame_num = frames[i]
-        if not underwater and above[i - 1] and not above[i]:
-            if last_entry_frame is not None and (frame_num - last_entry_frame) < min_cycle_frames:
-                continue  # periodicity signal: too soon to be a real new cycle
-            if excursion_confirms(i, going_down=True):
-                accepted.append(("entry", i))
-                underwater = True
-                last_entry_frame = frame_num
-        elif underwater and not above[i - 1] and above[i]:
-            if excursion_confirms(i, going_down=False):
-                accepted.append(("exit", i))
-                underwater = False
+    max_gap = ev_cfg["max_phase_gap_seconds"]
+    lookback = ev_cfg["max_crossing_seconds"]
 
-    events = []
-    for kind, i in accepted:
+    def crossing_before(p):
+        """Last confident upward crossing of the line before peak p, if it
+        was observed (both samples confident and close in time)."""
+        for j in range(p, 0, -1):
+            if t[p] - t[j] > lookback:
+                return None
+            if s[j - 1] >= 0 > s[j]:
+                return j if (t[j] - t[j - 1]) <= max_gap else None
+        return None
+
+    def crossing_after(p):
+        """First confident downward crossing after peak p, if observed."""
+        for j in range(p + 1, len(s)):
+            if t[j] - t[p] > lookback:
+                return None
+            if s[j - 1] < 0 <= s[j]:
+                return j if (t[j] - t[j - 1]) <= max_gap else None
+        return None
+
+    # Near / far arm by peak height: two clear groups mean alternate arms.
+    amp = np.array([height[p] for p in kept])
+    arm = ["unclassified"] * len(kept)
+    if len(kept) >= 4:
+        order_amp = np.argsort(amp)
+        gaps = np.diff(amp[order_amp])
+        cut = int(np.argmax(gaps)) + 1
+        low, high = amp[order_amp[:cut]], amp[order_amp[cut:]]
+        if len(low) >= 2 and len(high) >= 2 and np.median(high) >= (1 + ev_cfg["arm_split_min_ratio"]) * np.median(low):
+            thresh = (low.max() + high.min()) / 2
+            arm = ["near" if a >= thresh else "far" for a in amp]
+
+    def record(kind, j, extra=None):
+        i = idx[j]
         x_m, y_m = project_point(H, ref_x.iloc[i], ref_y.iloc[i])
-        events.append({
+        rec = {
             "event_type": kind,
             "frame": int(df["frame"].iloc[i]),
             "time_sec": float(df["time_sec"].iloc[i]),
@@ -174,13 +183,25 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
             "x_m": float(x_m),
             "y_m": float(y_m),
             "confidence": float(conf.iloc[i]),
-        })
+            "observed_gap_sec": float(t[j] - t[j - 1]) if j > 0 else 0.0,
+            "amplitude_px": None,
+            "arm": None,
+        }
+        if extra:
+            rec.update(extra)
+        return rec
 
-    signal = pd.DataFrame({
-        "frame": df["frame"], "time_sec": df["time_sec"],
-        "wrist_ref_y_smoothed": ref_y, "water_line_y": shoulder_y, "wrist_conf": conf,
-    })
-    return events, signal
+    events = []
+    for k, p in enumerate(kept):
+        ex = crossing_before(p)
+        en = crossing_after(p)
+        if ex is not None:
+            events.append(record("exit", ex, {"arm": arm[k]}))
+        events.append(record("peak", p, {"amplitude_px": float(height[p]), "arm": arm[k]}))
+        if en is not None:
+            events.append(record("entry", en, {"arm": arm[k]}))
+    events.sort(key=lambda e: e["time_sec"])
+    return events, plot
 
 
 def save_wrist_signal_plot(signal, events, video_path, track_id, hand, out_dir="outputs"):
@@ -194,8 +215,9 @@ def save_wrist_signal_plot(signal, events, video_path, track_id, hand, out_dir="
     ax.invert_yaxis()  # smaller y is higher in the frame -- flip so "up" reads as up
 
     for ev in events:
-        color = "tab:red" if ev["event_type"] == "entry" else "tab:green"
+        color = {"entry": "tab:red", "exit": "tab:green"}.get(ev["event_type"], "tab:blue")
         ax.axvline(ev["time_sec"], color=color, alpha=0.4, linewidth=1)
+    ax.plot([], [], color="tab:blue", label="recovery peak (stroke)")
     ax.plot([], [], color="tab:red", label="hand entry")
     ax.plot([], [], color="tab:green", label="hand exit")
 
@@ -234,6 +256,12 @@ def run_events(video_path, config, calibration_dir="data/calibration"):
         lane = track_df["lane"].mode().iloc[0] if track_df["lane"].notna().any() else None
         water_line_points = water_lines_by_lane.get(lane, next(iter(water_lines_by_lane.values())))
 
+        # One wrist channel only. The model's "left" and "right" wrist
+        # outputs were measured to carry the same peaks at the same times --
+        # it labels whichever arm is visible, not the anatomical side -- so
+        # a second channel would only duplicate every stroke. The
+        # better-tracked channel is used; near/far arm comes from peak
+        # height (see detect_events_for_track), not from the label.
         hand = pick_tracked_hand(track_df)
         events, signal = detect_events_for_track(track_df, hand, water_line_points, config, fps, H)
         for ev in events:
@@ -241,20 +269,19 @@ def run_events(video_path, config, calibration_dir="data/calibration"):
             ev["lane"] = lane
             ev["hand"] = hand
         all_events.extend(events)
-
-        plot_path = save_wrist_signal_plot(signal, events, video_path, track_id, hand)
-        plot_paths.append(plot_path)
+        plot_paths.append(save_wrist_signal_plot(signal, events, video_path, track_id, hand))
 
     # Explicit columns even when empty (zero events is a valid, honest
     # result -- e.g. no track had a long enough, clean crossing) so the
     # cached CSV still has a header row and can be read back rather than
     # round-tripping to a genuinely empty, unparseable file.
     event_columns = ["event_type", "frame", "time_sec", "ref_x", "ref_y", "x_m", "y_m",
-                      "confidence", "track_id", "lane", "hand"]
+                      "confidence", "observed_gap_sec", "amplitude_px", "arm", "track_id", "lane", "hand"]
     df = pd.DataFrame(all_events, columns=event_columns)
     entry_count = int((df["event_type"] == "entry").sum()) if not df.empty else 0
     diagnostics = {
         "event_entries_detected": entry_count,
+        "event_strokes_detected": int((df["event_type"] == "peak").sum()) if not df.empty else 0,
         "event_exits_detected": int((df["event_type"] == "exit").sum()) if not df.empty else 0,
         "event_tracks_processed": pose_df["track_id"].nunique() - skipped_short_tracks,
         "event_tracks_skipped_too_short": skipped_short_tracks,

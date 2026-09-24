@@ -315,8 +315,10 @@ produces huge files at full source resolution/framerate).
 ```
 
 Builds `outputs/<video>_report.docx` — a Word document written for the
-coach: stroke tempo, rhythm consistency, pacing across the swim, a tempo
-chart, three frames from the annotated video, and observations generated
+coach, about the filmed swimmer only (other people in the pool are left
+out): stroke tempo, rhythm consistency, pacing across the swim, the
+timing between the two arms (an even stroke vs a gallop), a tempo chart,
+three frames from the annotated video, and observations generated
 from the measured numbers. Deliberately leaves out diagnostics and every
 distance/speed figure (see CLAUDE.md section 8.10). Opens in Word or
 LibreOffice; export to PDF from there. The web page builds this at the end

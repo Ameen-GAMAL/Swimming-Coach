@@ -437,6 +437,53 @@ effect on DIVE_P023: frames with a usable camera-motion estimate went from
 5% to 93%, and tracks-found (after lane merge) dropped from 249 to 83.
 See `dynamic_background_region_frac`.
 
+**Amendment (measured on DIVE_P004): the tracker, not the detector, was
+losing most of the swim.** The fine-tuned detector found the swimmer in
+85% of sampled frames while the pipeline kept 35%, and the swimmer was at
+the surface throughout — this was never an underwater-visibility problem.
+Three ByteTrack settings had been copied in as the library's stock
+defaults and never adapted to this footage:
+
+- `fuse_score: true` multiplies IoU similarity by detection confidence
+  before matching, and `match_thresh 0.8` then demands confidence × IoU
+  ≥ 0.2. This detector's confidences run 0.15–0.35 (while hitting ~99% of
+  held-out frames), so a perfect-overlap detection at 0.18 could never
+  join a track. New counters in detect_track.py showed 3,155 of 4,669
+  frames with a detection but no tracked output. Now off: matching is on
+  IoU alone.
+- `new_track_thresh` / `track_high_thresh` 0.25 sat above much of that
+  confidence range, so no track could start in the harder stretches.
+  Both lowered to 0.15.
+- `track_buffer: 30` frames is ByteTrack's default for 30fps video — one
+  second. At this footage's 120fps it was 0.25s, shorter than an ordinary
+  splash gap (measured up to 0.66s), so every gap killed the track.
+  Replaced by `track_buffer_sec`, converted to frames at the clip's fps.
+
+The detect_track cache key now includes the `tracking` block and the
+detection threshold, so a tracker change can never silently reuse a
+cached result (it previously hashed only the camera-motion, colour and
+calibration settings). The diagnostics now report
+`detect_raw_detections`, `detect_dropped_outside_pool` and
+`detect_frames_detected_but_untracked`, so where detections go is always
+visible.
+
+**Follow-on fix, found by checking the result rather than the headline:**
+lowering the thresholds let the fine-tuned detector's DUPLICATE boxes
+start tracks. It often emits two or three nested boxes on one swimmer (a
+whole-body box and a partial one inside it); the old thresholds had
+happened to keep the weaker ones from ever starting a track. After the
+retune, DIVE_P022 showed 18 tracks all at the same position and size,
+2,286 frames carrying 3+ boxes, and every stroke counted about three
+times. Ordinary NMS cannot catch this: it measures IoU, which is low for a
+small box inside a large one — the duplicates had median IoU 0.60, under
+the detector's 0.7 NMS threshold, while their intersection over the
+SMALLER box's area had a median of 0.96. `suppress_nested_boxes` in
+detect_track.py drops any detection lying at least
+`detection.nested_box_iomin` (0.7) inside a higher-scoring one, before
+tracking. On the cached P022 boxes it removed 63% of them and left 3,483
+of 3,565 frames with exactly one box. It is also in the cache key and
+reported as `detect_nested_boxes_suppressed`.
+
 ### 8.2 Pose (`src/pose.py`)
 Run YOLO11-pose on the tracked swimmers only. The pretrained model already
 outputs the points we need: nose, shoulders, elbows, wrists, hips, knees,
@@ -514,6 +561,80 @@ to the zero-entries/zero-exits results seen on real clips throughout this
 build, independent of any detection-quality issue -- confirmed by re-
 running on cached pose data with no other change: 0 exits before the fix,
 1 exit after, on the same track.
+
+**Amendment (coach-report work, measured on real footage): strokes are
+now detected as RECOVERY PEAKS, not line crossings, and the reference is
+the swimmer's own shoulder line, not the calibrated water line.**
+
+Three measured facts forced this:
+
+1. *The water line cannot work here.* calibrate.py derives it from the far
+   lane rope, but the camera sits at water level so nearer water projects
+   lower in the image; on DIVE_P023 every wrist sample sat 15–281px below
+   that line, giving zero crossings in 3,962 samples.
+2. *Crossing detection fires on the underwater guesses.* The hand in the
+   air is the one thing the pose model tracks well (high confidence, a
+   large excursion above the shoulder). Once the hand goes under, the
+   model keeps emitting a wrist at confidence 0.1–0.3 that wobbles ±20px
+   around the line. Every crossing-based variant tried — look-ahead
+   confirmation, a Schmitt trigger, an entry debounce — either fired on
+   those guesses (23 of 30 "pulls" under 0.2s, i.e. shorter than the
+   recovery, the reverse of a real stroke) or, once made strict enough
+   to stop that, missed real entries and merged cycles (rhythm CV rose
+   from 21% to 38%).
+3. *The model's "left" and "right" wrist channels are the same signal.*
+   Plotted together they carry the same peaks at the same times: the
+   model labels whichever arm is visible, not the anatomical side. And
+   those peaks alternate large / small at exactly half the arm-cycle
+   period — consecutive peaks are ALTERNATE arms, the camera-side arm
+   rising higher in the image.
+
+So `detect_events_for_track` now: takes only confident samples
+(`wrist_conf_threshold`, which was previously used for the removed
+confidence-drop confirmation); finds recovery peaks with a prominence
+test scaled from the signal's own 5–95 percentile swing
+(`crossing_hysteresis_frac`), enforcing `min_stroke_seconds` between
+peaks; reads that stroke's **exit** as the last observed upward crossing
+of the shoulder line before the peak and its **entry** as the first
+observed downward crossing after it (within `max_crossing_seconds`, and
+only when the hand was observed within `max_phase_gap_seconds` before the
+crossing — every event carries `observed_gap_sec`); and classifies each
+peak near / far by height when the two groups separate by
+`arm_split_min_ratio`. Only the better-tracked wrist channel is used —
+a second channel would duplicate every stroke.
+
+**Units, corrected:** one peak is one ARM stroke. The figure previously
+reported as "cycles/min" was strokes/min; a full two-arm cycle is two
+strokes. `metrics.py` now emits `stroke_count`, `stroke_rate_spm`,
+`cycle_rate_cpm` (= spm / 2), `stroke_interval_cv_pct`,
+`arm_cycle_cv_pct` (the rhythm figure), `strokes_missed_estimate`, the
+recovery / pull split (`recovery_sec_mean`, `pull_sec_mean`,
+`arm_cycle_sec_mean`, `recovery_fraction_mean`, `recovery_sec_cv_pct`,
+`phase_strokes_measured`) and near/far arm figures.
+
+**Same-arm pairing is by time, not by index.** Consecutive peaks are
+alternate arms only when both arms' recoveries are detected; the far
+arm's smaller recovery is sometimes missed for a whole stretch, and then
+consecutive peaks are the SAME arm. Pairing peak k with k+2 was measured
+on DIVE_P004 to halve the reported rate (29 instead of ~55 strokes/min on
+one track) and give a 9% recovery share against phase figures that said
+21%. `stroke_records` instead finds an arm's next stroke as the first
+later peak at least `arm_cycle_min_seconds` (1.5s) away, within
+`arm_cycle_max_seconds` (3.5s) — a physical prior: a freestyle
+half-cycle runs ~0.75–1.3s and a full arm cycle ~1.8–2.6s. An interval
+between consecutive peaks that reaches `arm_cycle_min_seconds` is read as
+a missed stroke and halved. Stroke rate comes from the MEDIAN of those
+half-cycle intervals, not strokes-over-window, which two missed peaks
+had dragged from 55 to 45 on a 12-stroke track.
+
+The recovery is measured directly — both of its boundaries are moments
+the hand is at the surface and visible; the pull runs entry → the same
+arm's next exit and is reported only when that exit was observed too.
+The per-length cycle counting in `compute_length_metrics` still pairs
+entries and exits and is unchanged.
+
+`min_cycle_seconds` and `confidence_drop_window_frames` are gone; the
+Phase 6 state machine and its bug fix above are superseded.
 
 ### 8.4 Lap splitting
 The client's definition for this POC: a lap is complete when the swimmer
@@ -617,25 +738,82 @@ end of every run and offered in the app's Results tab. It is written for
 the coach, not the engineer: no diagnostics, no system caveats, no
 distance or speed figures.
 
-What it contains, and why only this:
-- **Stroke tempo** (cycles/min), **rhythm consistency** (cycle-time
-  variation), and **pacing** (tempo change from the earliest to the latest
-  tracked segment) — all derived from the video's timestamps alone, so
-  they carry none of the distance-scale error.
-- A tempo-through-the-swim chart, a per-segment table, and three frames
-  from the annotated video.
+**Only the filmed swimmer.** The pipeline tracks everyone it sees (the
+spec is multi-lane), but the report is about one swimmer, whom the camera
+keeps nearest and largest in shot. `subject_track_ids` keeps a track when
+it is the largest box on screen in at least half its frames and its
+median box is at least half the size of the largest substantial track's.
+Measured on DIVE_P004 before this existed: a far-lane swimmer and a group
+at the pool edge were being timed and folded into "the swimmer's" tempo.
+Across P004 / P022 / P023 the excluded tracks sat at 22–45% of the
+subject's box size and were largest in 1–27% of their frames; the
+subject's own substantial tracks at 61%+ and 76%+. The app's summary line
+and results chart use the same selection; the results table still lists
+everyone.
+
+What it contains — every figure is built on stroke TIMES (the recovery
+peaks), the one thing this pipeline measures reliably: the same peaks gave
+27, 27 and 29 cycles/min for three different swimmers with 7–10% rhythm
+variation, consistent in the way real training swims should be.
+- **Stroke tempo** (strokes/min; each arm's recovery is one stroke, so
+  cycles/min is half), **rhythm** (each arm's cycle-time variation),
+  **pacing** (tempo change from the earliest to the latest segment).
+- **Timing between the arms**: the half-cycle from a camera-side stroke to
+  the next far-side one against the half-cycle back. Equal means an even
+  stroke; one consistently longer is a gallop, often tied to one-sided
+  breathing. Flagged only when the difference is ≥10% AND larger than
+  twice its standard error. Measured on P022 / P023: 8–25% scatter per
+  direction over 5–24 intervals, both swimmers even. Needs at least 3
+  intervals each way, so on P004 — whose arms mostly could not be told
+  apart — it reports nothing rather than guessing. Arms are told apart by
+  peak height (the camera-side arm rises higher); "camera-side" is left
+  or right depending on the direction of swim, and the report says so. A
+  left/right split by the pose model's labels would be fiction — those
+  labels follow whichever arm is visible.
+- A tempo-through-the-swim chart, per-segment and arm-timing tables, and
+  three frames from the annotated video.
 - **Observations** generated from those numbers, phrased as what was
   measured and what is worth checking on the video — never as a
-  prescription. The coach's own reading of technique takes precedence and
-  the report says so.
-- Reference tempo ranges come from `benchmarks.freestyle` and are labelled
-  as general reference ranges, since those values are placeholders.
+  prescription; the coach's own reading takes precedence and the report
+  says so. Thresholds (steady ≤12% / uneven >20% arm-cycle variation,
+  pacing ±10%, arm timing ≥10% and >2 SE) are module constants, chosen to
+  flag only clear cases.
+- A segment whose tempo sits outside 0.65–1.5× the swimmer's own median
+  is treated as a detection artefact (double peaks, or a stretch with
+  every other stroke missed), shown in the table marked "(check)" and
+  left out of the pacing, range and rhythm statements.
+- Reference tempo ranges come from `benchmarks.freestyle`, which stay in
+  CYCLES/min; the report converts strokes/min down by half before
+  comparing, and doubles the band before drawing it on the strokes/min
+  chart. Found by inspection: comparing strokes/min directly against the
+  cycles/min band had labelled a 28 cycles/min, distance-style swim as
+  "sprint-range". The ranges are labelled as general reference ranges
+  since those values are placeholders.
 
-Deliberately excluded: the pull/recovery phase split. The events data
-carries entry→exit pairs as close as 30–50 ms apart (jitter around the
-shoulder line), and the minimum-cycle rule guards only entry-to-entry
-spacing, so a within-cycle phase split would be built on noise. Add it
-only once entry→exit spacing has its own guard.
+**Not included, and why:**
+- **Pull / recovery durations** (the phase split the user asked for).
+  Built, measured, and left out of the report because it is not reliable
+  yet. What the wrist signal can split on is the swimmer's shoulder height,
+  so the "recovery" it yields is only the high part of the real recovery
+  (the time the hand is above shoulder height) and the "pull" also holds
+  the start and end of the recovery. Worse, that duration is not stable:
+  on three swimmers at nearly the same 2.1 s arm cycle it came to 0.27 s,
+  0.43 s and 0.93 s, with 36–46% scatter stroke to stroke inside a clip;
+  measuring the recovery peak's width at half prominence instead was
+  worse (43–79%). The peaks are narrow and the boundaries noisy — good
+  enough to TIME a stroke, not to time its phases. An earlier version
+  reported it anyway, first as "out of the water" and judged against the
+  textbook ~25–30% recovery share (calling one swimmer's "a quick recovery
+  ... a long, patient pull"), then relabelled as time above shoulder
+  height — both would have put noise in front of a coach as a coaching
+  point. The numbers are still computed and written to the metrics CSV
+  (`recovery_sec_mean`, `pull_sec_mean`, `recovery_fraction_mean`,
+  `recovery_sec_cv_pct`). The likely routes to a real phase split are the
+  underwater footage the dataset has for the same sessions (it shows the
+  pull directly) or a pose model fine-tuned on swimmers' wrists.
+- **Breathing pattern**. Nose / eye keypoint visibility was tested as a
+  breath proxy and gave 6 "breaths" in 7.7s on one clip and 1 in 4.5s on
+  another — not validated, so not reported.
 
 `summarise_run()` in the same module derives every count from the cached
 stage outputs; the app's summary line and Diagnostics tab read from it

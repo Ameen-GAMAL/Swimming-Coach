@@ -38,13 +38,18 @@ pool_area_margin_m: 3.0       # allowed slack around the calibrated pool area be
 
 tracking:
   # ByteTrack settings (matches the fixed decision: Tracker = ByteTrack).
-  # Values are the library's own defaults, made visible here so they're tunable.
-  track_high_thresh: 0.25     # first-stage match threshold; raise for cleaner tracks, lower to keep more
-  track_low_thresh: 0.10      # second-stage threshold for low-score matches
-  new_track_thresh: 0.25      # start a new track if no match scores at least this
-  track_buffer: 30            # frames to keep a lost track alive before dropping it
+  # The stock library defaults were originally copied in unchanged; the
+  # three below were retuned after measuring where detections went on
+  # DIVE_P004 -- the detector found the swimmer in 85% of sampled frames
+  # while the pipeline kept 35%, and the seconds it dropped were exactly the
+  # ones where detection confidence sat at 0.18-0.24: below the stock
+  # new_track_thresh of 0.25, so no track could ever start there.
+  track_high_thresh: 0.15     # first-stage match threshold -- lowered from the stock 0.25 to sit inside this detector's confidence range (median ~0.29 on held-out clips, routinely 0.18-0.24 in harder stretches)
+  track_low_thresh: 0.10      # second-stage threshold for low-score matches (= detection.conf_threshold, so ByteTrack sees everything the detector emits)
+  new_track_thresh: 0.15      # start a new track if no match scores at least this -- lowered from the stock 0.25 for the reason above
+  track_buffer_sec: 1.0       # how long a lost track is kept alive, in SECONDS (converted to frames at the clip's fps). Replaces track_buffer: 30 frames, ByteTrack's default for 30fps video -- at this footage's 120fps that was 0.25s, shorter than an ordinary splash gap (measured up to 0.66s)
   match_thresh: 0.80          # association similarity threshold (IoU-based)
-  fuse_score: true            # combine detection confidence with motion/IoU when matching
+  fuse_score: false           # OFF. When on, ByteTrack multiplies IoU similarity by detection confidence before matching, and match_thresh 0.8 then demands confidence x IoU >= 0.2 -- so a detection at confidence 0.18 with PERFECT overlap can never join a track. Measured on DIVE_P004 with the counters in detect_track.py: 3155 of 4669 frames had a detection but no tracked output, even after new_track_thresh was lowered, because this detector's confidences run 0.15-0.35 (while hitting ~99% of frames). Score fusion assumes a detector whose confidences run 0.5-0.9; here it is harmful. Matching is on IoU alone.
   id_reuse_max_gap_sec: 2.0   # if a track ends and a new one starts within this long, treat it as the same swimmer (dataset is single-swimmer, single-lane trials -- see data/candidates.md)
   min_segment_frames_for_merge: 5  # a track-ID segment shorter than this doesn't anchor the merge chain -- measured on real footage: 74% of all segments are exactly 1 frame (noise blips, often a YOLO box and a colour-fusion box of the same swimmer that didn't overlap enough to count as one detection), and letting them anchor the chain caused spurious time-overlaps that kept resetting it instead of bridging real gaps. See detect_track.py's merge_continuous_tracks.
   max_overlap_frames_for_merge: 50   # two substantial segments overlapping in time by up to this many frames may still be merged, if their mean positions agree (see max_merge_distance_m) -- measured on real footage: this is usually ByteTrack briefly double-tracking the same swimmer during an ID handoff, not a second object
@@ -143,6 +148,7 @@ detection:
   # median top confidence per frame was only ~0.13 with yolo11m. See
   # CLAUDE.md section 3 amendment notes / Phase 4 report for the measurement.
   conf_threshold: 0.10
+  nested_box_iomin: 0.7       # a detection whose area lies at least this much inside a higher-scoring box is dropped as a duplicate of the same swimmer. Ordinary NMS uses IoU, which is low for a small box nested in a large one -- measured on DIVE_P022, duplicate boxes had median IoU 0.60 (kept by the 0.7 NMS threshold) but median intersection-over-smaller-area 0.96, and each became its own track, counting every stroke ~3 times
   batch_size: 16
   half_precision: true
 
@@ -153,12 +159,16 @@ pose:
   half_precision: true
 
 events:
-  wrist_conf_threshold: 0.40
-  min_cycle_seconds: 0.6      # Anything faster than this is noise
+  wrist_conf_threshold: 0.30  # a wrist sample below this confidence is ignored by the stroke state machine (matches pose.conf_threshold). Measured on real footage: right after entry the wrist goes under, confidence drops to 0.1-0.3 and the reported position wobbles +/-20px around the shoulder line -- those guesses were firing spurious exits. Previously 0.40 and used only for the (removed) confidence-drop confirmation.
+  min_stroke_seconds: 0.4     # two recovery peaks closer than this are one stroke -- consecutive peaks are ALTERNATE arms (measured: they alternate large/small at half the arm-cycle period), so at a fast 70 strokes/min they sit ~0.85s apart and this leaves margin
+  max_crossing_seconds: 0.8   # how far before/after a recovery peak to look for the hand's exit/entry crossing of the shoulder line; further than this and the crossing belongs to a different stroke
+  arm_cycle_min_seconds: 1.5  # a gap between detected strokes at least this long is a FULL arm cycle (the alternate arm's stroke was missed), not a half-cycle -- physical prior: a freestyle half-cycle runs ~0.75-1.3s, a full arm cycle ~1.8-2.6s. Used to normalise tempo (such an interval is halved) and to find the same arm's next stroke by time rather than by index
+  arm_cycle_max_seconds: 3.5  # beyond this, the next peak is a gap in tracking, not this arm's next stroke -- no pull or arm cycle is measured across it
+  arm_split_min_ratio: 0.35   # peaks are split into near-side / far-side arm by height only when the taller group's median is at least this much above the shorter group's -- the camera-side arm rises higher in the image, and a clear split is what makes the alternation trustworthy
   smoothing_window: 5         # Frames, to steady the wrist signal
-  confidence_drop_window_frames: 15  # how many frames after a crossing to look for the confidence dip/rise that confirms it
-  crossing_hysteresis_frac: 0.15  # a crossing of the shoulder line only counts once the wrist travels this fraction of the signal's own 10-90 percentile spread clear of it. Scaled from the signal rather than fixed in pixels so it follows the swimmer through perspective; without it, keypoint jitter around the line produced about twice as many raw crossings as real strokes.
-  max_sample_gap_frames: 15   # two pose samples further apart than this (0.125s at 120fps) are not treated as a crossing: pose emits no row when a crop yields no person, so consecutive ROWS can sit a second or more apart, and a flip across that gap was never observed -- only inferred from missing data
+  crossing_hysteresis_frac: 0.18  # minimum height AND prominence of a recovery peak, as a fraction of the wrist signal's own 5-95 percentile swing (so it follows the swimmer through perspective). Measured on DIVE_P004: at 0.25 the far-side arm's smaller recovery often fell below it and every miss doubled a stroke interval (~2.2s where ~1.05s was right); at 0.15 double-peaks under 0.5s appeared; 0.18 filled the misses without the doubles.
+  max_phase_gap_seconds: 0.25  # a stroke phase (pull or recovery) is only timed when the hand had been observed within this long before BOTH of its boundary events; a boundary inferred across a longer gap is skipped for phase timing (the cycle itself still counts). Events carry observed_gap_sec for this.
+  min_phase_seconds: 0.15      # shortest pull or recovery duration accepted as real -- a freestyle recovery takes ~0.4-0.6s and the underwater phase (entry to the same arm's next exit) ~1.5-2s at a moderate tempo, so anything under this is a boundary error, not a stroke phase
   min_track_frames_for_analysis: 60  # tracks shorter than this can't show even one full stroke cycle -- skip rather than produce a near-empty plot
 
 quality:

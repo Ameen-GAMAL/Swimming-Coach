@@ -405,13 +405,52 @@ def detect_color_blob(frame, config):
     return float(x1r), float(y1r), float(x2r), float(y2r)
 
 
-def build_tracker_args(config):
+def suppress_nested_boxes(boxes, iomin_thresh):
+    """Drops a detection that sits mostly inside a higher-scoring one.
+
+    The fine-tuned detector often emits two or three nested boxes on one
+    swimmer -- a whole-body box and a partial one inside it. Ordinary NMS
+    measures IoU, and a small box inside a large one has a low IoU even
+    when it is entirely contained, so NMS keeps both. Measured on
+    DIVE_P022 across 9,915 pairs of concurrent boxes: IoU median 0.60 (under
+    the 0.7 NMS threshold, so kept) while intersection over the SMALLER
+    box's area had a median of 0.96. Each survivor then started its own
+    track, and every stroke was counted about three times. Intersection
+    over the smaller area is what identifies a nested box."""
+    n = len(boxes)
+    if n < 2:
+        return boxes, 0
+    xyxy = boxes.xyxy
+    area = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+    order = np.argsort(-boxes.conf)
+    kept = []
+    for i in order:
+        suppressed = False
+        for j in kept:
+            ix = max(0.0, min(xyxy[i, 2], xyxy[j, 2]) - max(xyxy[i, 0], xyxy[j, 0]))
+            iy = max(0.0, min(xyxy[i, 3], xyxy[j, 3]) - max(xyxy[i, 1], xyxy[j, 1]))
+            smaller = min(area[i], area[j])
+            if smaller > 0 and (ix * iy) / smaller >= iomin_thresh:
+                suppressed = True
+                break
+        if not suppressed:
+            kept.append(i)
+    kept.sort()
+    return boxes[np.array(kept, dtype=int)], n - len(kept)
+
+
+def build_tracker_args(config, fps):
     t = config["tracking"]
     return types.SimpleNamespace(
         track_high_thresh=t["track_high_thresh"],
         track_low_thresh=t["track_low_thresh"],
         new_track_thresh=t["new_track_thresh"],
-        track_buffer=t["track_buffer"],
+        # ByteTrack's buffer is in FRAMES; its stock value of 30 assumes
+        # 30fps video (one second). This footage is 120fps, where 30 frames
+        # is a quarter of a second -- shorter than an ordinary splash gap
+        # (measured up to 0.66s), so every gap killed the track and a fresh
+        # one then had to clear new_track_thresh to restart.
+        track_buffer=max(1, int(round(t["track_buffer_sec"] * fps))),
         match_thresh=t["match_thresh"],
         fuse_score=t["fuse_score"],
     )
@@ -485,7 +524,7 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
     reanchor_inlier_floor = cm_cfg["keyframe_reanchor_inlier_floor"]
 
     model = YOLO(config["detection"]["model"])
-    tracker = BYTETracker(build_tracker_args(config), frame_rate=int(round(fps)))
+    tracker = BYTETracker(build_tracker_args(config, fps), frame_rate=int(round(fps)))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     batch_size = config["detection"]["batch_size"]
@@ -502,6 +541,10 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
     color_blob_found = 0
     color_blob_confirmed = 0
     color_blob_synthesized = 0
+    raw_detections_total = 0
+    nested_suppressed = 0
+    dropped_outside_pool = 0
+    frames_detected_but_untracked = 0
     frame_idx = 0
 
     while frame_idx < frame_count:
@@ -577,6 +620,9 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
                 frames_low_motion_confidence += 1
 
             boxes = result.boxes.cpu().numpy()
+            raw_detections_total += len(boxes)
+            boxes, n_nested = suppress_nested_boxes(boxes, config["detection"]["nested_box_iomin"])
+            nested_suppressed += n_nested
             boxes, motion_status = fuse_synthetic_detection(
                 boxes, motion_box_raw,
                 config["camera_motion"]["motion_yolo_iou_match"],
@@ -620,6 +666,13 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
 
             filtered = boxes[keep]
             tracks = tracker.update(filtered, img=frame)
+            # Where detections go. Measured on DIVE_P004 before these
+            # counters existed: the detector found the swimmer in 85% of
+            # sampled frames while the pipeline kept 35%, and nothing in
+            # the diagnostics said which stage had dropped the rest.
+            dropped_outside_pool += int((~keep).sum())
+            if len(filtered) and len(tracks) == 0:
+                frames_detected_but_untracked += 1
 
             # Flattened so pose.py can rebuild this frame's raw-pixel ->
             # reference-frame transform for its own keypoints, without
@@ -661,6 +714,10 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
         "detect_frames_total": frame_count,
         "detect_frames_low_motion_confidence": frames_low_motion_confidence,
         "detect_camera_keyframes": keyframes_promoted,
+        "detect_raw_detections": raw_detections_total,
+        "detect_nested_boxes_suppressed": nested_suppressed,
+        "detect_dropped_outside_pool": dropped_outside_pool,
+        "detect_frames_detected_but_untracked": frames_detected_but_untracked,
         "detect_tracks_before_merge": tracks_before_merge,
         "detect_tracks_found": df["track_id"].nunique() if not df.empty else 0,
         "detect_longest_track_frames": longest_track_frames,
@@ -683,7 +740,9 @@ def cache_path(video_path, config, cache_dir=None, calibration_dir="data/calibra
     conf = config["detection"]["conf_threshold"]
     # Tuning camera_motion/color_localize and rerunning should never silently
     # reuse a cached result from before the tuning change.
-    key = {"camera_motion": config["camera_motion"], "color_localize": config["color_localize"]}
+    key = {"camera_motion": config["camera_motion"], "color_localize": config["color_localize"],
+           "tracking": config["tracking"], "detection_conf": config["detection"]["conf_threshold"],
+           "nested_box_iomin": config["detection"]["nested_box_iomin"]}
     # The calibration belongs in the key too: every x_m/y_m in the cached
     # rows is produced by its homography, so recalibrating and rerunning
     # otherwise returned the old world positions without a word.

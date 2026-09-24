@@ -95,12 +95,13 @@ def results_summary_md(s):
     # from summarise_run(), which derives every count from the cached
     # stage outputs, so a cached run shows the same numbers as a fresh one
     # (previously the cached path had no counts and printed "n/a").
-    tempo = (f"{s['median_cpm_multi']:.0f} cycles/min" if s["median_cpm_multi"] is not None
-             else (f"{s['median_cpm']:.0f} cycles/min (single-cycle segments only)" if s["median_cpm"] is not None
+    tempo = (f"{s['median_spm_multi']:.0f} strokes/min (≈{s['median_spm_multi']/2:.0f} cycles/min)"
+             if s["median_spm_multi"] is not None
+             else (f"{s['median_spm']:.0f} strokes/min (short segments only)" if s["median_spm"] is not None
                    else "not measurable"))
-    return (f"**Summary** -- Swimmer in view: **{s['coverage_pct']:.0f}%** of frames · "
+    return (f"**Summary** -- Swimmer in view: **{s['subject_coverage_pct']:.0f}%** of frames · "
             f"Longest continuously-tracked segment: **{s['longest_track_sec']:.1f}s** ({s['longest_track_frames']} frames) · "
-            f"Stroke cycles timed: **{s['cycles_total']}** · Median stroke tempo: **{tempo}** · "
+            f"Strokes timed: **{s['strokes_total']}** · Median stroke tempo: **{tempo}** · "
             f"Lengths accepted: **{s['lengths_accepted']} / {s['lengths_computed']}**")
 
 
@@ -109,16 +110,17 @@ def diagnostics_summary_md(s):
 ### Detection & tracking
 - Frames in clip: {s['frames_total']:,} at {s['fps']:.2f} fps
 - Frames with a detection: {s['frames_detected']:,} ({s['coverage_pct']:.1f}%)
-- Tracks found (after merge): {s['tracks']} -- longest {s['longest_track_frames']} frames ({s['longest_track_sec']:.1f}s)
+- Tracks found (after merge): {s['tracks']} -- {s['subject_tracks']} on the filmed swimmer, {s['other_people_tracks']} on other people in the pool
+- Filmed swimmer in view: {s['subject_coverage_pct']:.1f}% of frames -- longest continuous track {s['longest_track_frames']} frames ({s['longest_track_sec']:.1f}s)
 
 ### Pose
 - Wrist visibility: {s['wrist_visible_pct']:.1f}% of attempted detections (gate: ≥70%)
 - Pose readings produced: {s['pose_rows']:,}
 
 ### Stroke events
-- Entries detected: {s['entries']}
-- Exits detected: {s['exits']}
-- Cycles timed: {s['cycles_total']} across {s['tracks_with_cycles']} tracks ({s['tracks_with_two_plus_cycles']} with 2+ cycles)
+- Strokes timed (recovery peaks): {s['strokes_total']} across {s['tracks_with_strokes']} tracks ({s['tracks_multi']} with 3+ strokes)
+- Hand entries / exits observed at the shoulder line: {s['entries']} / {s['exits']}
+- Strokes with a measured arm carry (hand above shoulder height -- in the metrics CSV, not the coach report): {s['phase_strokes']}
 
 ### Metrics / quality gate
 - Lengths computed: {s['lengths_computed']}
@@ -128,18 +130,23 @@ def diagnostics_summary_md(s):
 """
 
 
-def build_cycle_chart(metrics_df):
+def build_cycle_chart(metrics_df, subject_ids):
     # Charts the per-track stroke timing rather than per-length figures.
     # Stroke rate is derived from timestamps alone, so it survives the
     # unresolved distance-scale problem that leaves every per-length
-    # stroke_rate_cpm/distance_per_cycle_m blank.
-    if metrics_df.empty or "row_type" not in metrics_df:
+    # stroke_rate_cpm/distance_per_cycle_m blank. Unit is strokes per
+    # minute -- each arm's recovery is one stroke; cycles/min is half.
+    if metrics_df.empty or "row_type" not in metrics_df or "stroke_rate_spm" not in metrics_df:
         return None
-    tracks = metrics_df[(metrics_df["row_type"] == "track") & metrics_df["stroke_rate_cpm"].notna()]
+    # Only the filmed swimmer's tracks, matching the summary and the coach
+    # report -- other people in the pool are still in the results table.
+    tracks = metrics_df[(metrics_df["row_type"] == "track") & metrics_df["stroke_rate_spm"].notna()
+                        & metrics_df["track_id"].isin(subject_ids)]
     if tracks.empty:
         return None
-    chart_df = tracks[["track_id", "stroke_rate_cpm", "cycle_count"]].melt(
+    chart_df = tracks[["track_id", "stroke_rate_spm", "stroke_count"]].melt(
         id_vars="track_id", var_name="metric", value_name="value")
+    chart_df["track_id"] = chart_df["track_id"].astype(int).astype(str)
     return chart_df
 
 
@@ -227,7 +234,7 @@ def run_pipeline(uploaded_file, picked_video, progress=gr.Progress()):
     ) if os.path.isdir("outputs") else []
 
     diag_md = diagnostics_summary_md(summary)
-    chart_df = build_cycle_chart(metrics_df)
+    chart_df = build_cycle_chart(metrics_df, summary["subject_ids"])
 
     yield (render_stage_status(n, n), summary_md, callout, annotated_path, display_df,
            chart_df, wrist_plots, calib_preview, diag_md, report_path)
@@ -268,7 +275,7 @@ with gr.Blocks(title="Swimming Performance Tracking (POC)") as demo:
                 with gr.Column():
                     chart_out = gr.BarPlot(
                         x="track_id", y="value", color="metric",
-                        title="Stroke rate (cycles/min) and cycle count, per tracked swimmer",
+                        title="Stroke rate (strokes/min) and strokes counted, per tracked segment of the filmed swimmer",
                         x_title="Track", y_title="Value", height=280)
             table_out = gr.Dataframe(label="Results (per length, per lap, and per track)",
                                       value=pd.DataFrame([{"note": "Run an analysis to see results here."}]))

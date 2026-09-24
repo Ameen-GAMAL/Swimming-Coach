@@ -1,14 +1,20 @@
 # Builds the downloadable swim report: a Word document written for the
 # coach, not the engineer. It collates what the other stages already
 # produced -- nothing here computes a new measurement -- and keeps to the
-# figures that come from the video's own timestamps (stroke tempo, rhythm
-# consistency, pacing across the swim), because those are the ones the
-# pipeline measures reliably. Distance and speed are deliberately absent.
+# figures that come from the timing of the swimmer's strokes (tempo,
+# rhythm, pacing, and the timing between the two arms), because those are
+# the ones the pipeline measures reliably. Distance, speed and the duration
+# of individual stroke phases are deliberately absent -- see CLAUDE.md
+# section 8.10 for why the phase durations did not make it in.
 #
 # All counts are derived from the cached stage outputs rather than the
 # stages' live diagnostics dicts, so a report built from a cached run
 # carries the same numbers as one built from a fresh run; the app's own
 # summary uses summarise_run() for the same reason.
+#
+# Units: a STROKE is one arm's recovery (each recovery peak in the wrist
+# signal). Consecutive strokes are alternate arms, so a full CYCLE (both
+# arms) is two strokes, and cycles/min is half of strokes/min.
 
 import argparse
 import os
@@ -29,16 +35,20 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 from src.detect_track import run_detect_track_cached
-from src.events import load_calibration, run_events_cached
-from src.metrics import run_metrics_cached
+from src.events import load_calibration, pick_tracked_hand, run_events_cached
+from src.metrics import run_metrics_cached, stroke_records
 from src.pose import run_pose_cached
 from src.profiling import Timer, load_config
 
 ANNOTATED_FRAME_FRACS = (0.2, 0.5, 0.8)
-STEADY_CV_PCT = 12.0      # cycle-time variation at or below this reads as a steady rhythm
-UNEVEN_CV_PCT = 20.0      # above this, worth a look at the video
-PACING_CHANGE_PCT = 10.0  # tempo change between early and late segments worth remarking on
-MIN_CYCLES_FOR_PICTURE = 6
+MIN_STROKES_STEADY = 3        # a segment needs this many strokes before its rhythm is rated
+STEADY_CV_PCT = 12.0          # arm-cycle time variation at or below this reads as a steady rhythm
+UNEVEN_CV_PCT = 20.0          # above this, worth a look at the video
+PACING_CHANGE_PCT = 10.0      # tempo change between early and late segments worth remarking on
+ARM_TIMING_DIFF_PCT = 10.0    # difference between the two half-cycles worth remarking on (also must exceed 2x its standard error)
+MIN_ARM_PAIRS = 3             # arm-to-arm intervals needed in EACH direction before arm timing is compared
+MIN_STROKES_FOR_PICTURE = 8
+PLAUSIBLE_SPM_BAND = (0.65, 1.5)  # a segment's tempo this far from the swimmer's own median is a detection artefact (double peaks, or every other stroke missed), not a real change of pace
 
 
 def stem_of(video_path):
@@ -61,6 +71,37 @@ def session_info(video_path):
     }
 
 
+SUBJECT_MIN_PRIMARY_FRAC = 0.5   # share of a track's frames in which it is the largest box on screen
+SUBJECT_MIN_AREA_FRAC = 0.5      # its median box area relative to the largest-boxed substantial track
+
+
+def subject_track_ids(tracks_df, min_track_frames):
+    """The tracks that belong to the filmed swimmer, as opposed to other
+    people in the pool.
+
+    The pipeline tracks everyone it sees (the spec is multi-lane), but the
+    report is about one swimmer, and the camera walks alongside that
+    swimmer, keeping them the nearest -- largest -- person in shot. A track
+    is the subject's when it is the largest box on screen in most of its
+    frames AND its typical box is comparable in size to the largest
+    substantial track. Measured on DIVE_P004 before this existed: a
+    far-lane swimmer and a group at the pool edge were being timed and
+    their strokes folded into "the swimmer's" tempo. On P004, P022 and
+    P023 the excluded tracks sat at 22-45% of the subject's box size and
+    were the largest box in 1-27% of their frames; the subject's own
+    substantial tracks sat at 61%+ and 76%+."""
+    if tracks_df.empty:
+        return set()
+    d = tracks_df.assign(area=(tracks_df["x2"] - tracks_df["x1"]) * (tracks_df["y2"] - tracks_df["y1"]))
+    primary = d.loc[d.groupby("frame")["area"].idxmax(), "track_id"].value_counts()
+    g = d.groupby("track_id").agg(n=("frame", "size"), med_area=("area", "median"))
+    substantial = g[g["n"] >= min_track_frames]
+    ref = substantial["med_area"].max() if len(substantial) else g["med_area"].max()
+    primary_frac = primary.reindex(g.index).fillna(0) / g["n"]
+    keep = (primary_frac >= SUBJECT_MIN_PRIMARY_FRAC) & (g["med_area"] >= SUBJECT_MIN_AREA_FRAC * ref)
+    return set(g.index[keep])
+
+
 def summarise_run(video_path, config, calibration_dir="data/calibration"):
     """Every number the report (and the app's summary) needs, derived from
     the stage outputs themselves so cached and fresh runs read identically."""
@@ -76,58 +117,99 @@ def summarise_run(video_path, config, calibration_dir="data/calibration"):
     cap.release()
 
     frames_detected = int(tracks_df["frame"].nunique()) if not tracks_df.empty else 0
-    track_sizes = tracks_df["track_id"].value_counts() if not tracks_df.empty else pd.Series(dtype=int)
+    subject_ids = subject_track_ids(tracks_df, config["events"]["min_track_frames_for_analysis"])
+    subject_df = tracks_df[tracks_df["track_id"].isin(subject_ids)] if not tracks_df.empty else tracks_df
+    subject_frames = int(subject_df["frame"].nunique()) if not subject_df.empty else 0
+    track_sizes = subject_df["track_id"].value_counts() if not subject_df.empty else pd.Series(dtype=int)
     longest_frames = int(track_sizes.max()) if len(track_sizes) else 0
 
-    track_rows = (metrics_df[metrics_df["row_type"] == "track"].copy()
+    track_rows = (metrics_df[(metrics_df["row_type"] == "track") & metrics_df["track_id"].isin(subject_ids)].copy()
                   if not metrics_df.empty and "row_type" in metrics_df else pd.DataFrame())
     if not track_rows.empty:
         span = tracks_df.groupby("track_id")["frame"].agg(["min", "max"]) / fps
         track_rows["t_start"] = track_rows["track_id"].map(span["min"])
         track_rows["t_end"] = track_rows["track_id"].map(span["max"])
         track_rows = track_rows.sort_values("t_start").reset_index(drop=True)
-    cpm = track_rows["stroke_rate_cpm"].dropna() if not track_rows.empty else pd.Series(dtype=float)
-    multi = track_rows[track_rows["cycle_count"] >= 2] if not track_rows.empty else pd.DataFrame()
+
+    # per-stroke records for the phase chart, primary hand per track
+    strokes = []
+    if not events_df.empty and not pose_df.empty:
+        for tid, g in events_df[events_df["track_id"].isin(subject_ids)].groupby("track_id"):
+            for s in stroke_records(g, config):
+                s["track_id"] = tid
+                strokes.append(s)
+    strokes_df = pd.DataFrame(strokes)
+
+    def med(col, frame):
+        return float(frame[col].dropna().median()) if len(frame) and frame[col].notna().any() else None
+
+    multi = track_rows[track_rows["stroke_count"] >= MIN_STROKES_STEADY] if not track_rows.empty else pd.DataFrame()
+    spm_all = track_rows["stroke_rate_spm"].dropna() if not track_rows.empty else pd.Series(dtype=float)
+    # A segment whose tempo sits far outside the swimmer's own median is a
+    # detection artefact, not pacing: double peaks read as ~100 strokes/min,
+    # a stretch with every other stroke missed as ~half. Only plausible
+    # segments feed the pacing and range statements; the rest are shown in
+    # the table flagged "check".
+    ref_spm = med("stroke_rate_spm", multi)
+    if not track_rows.empty:
+        lo, hi = PLAUSIBLE_SPM_BAND
+        track_rows["plausible"] = (track_rows["stroke_rate_spm"].notna() & (ref_spm is not None)
+                                   & (track_rows["stroke_rate_spm"] >= lo * (ref_spm or 0))
+                                   & (track_rows["stroke_rate_spm"] <= hi * (ref_spm or 0)))
+        multi = track_rows[(track_rows["stroke_count"] >= MIN_STROKES_STEADY) & track_rows["plausible"]]
 
     calib = load_calibration(video_path, calibration_dir)
-
     return {
         "video": os.path.basename(video_path),
-        "frames_total": frames_total,
-        "fps": fps,
-        "duration_sec": frames_total / fps,
+        "frames_total": frames_total, "fps": fps, "duration_sec": frames_total / fps,
         "resolution": f"{width}x{height}",
         "frames_detected": frames_detected,
         "coverage_pct": 100.0 * frames_detected / frames_total if frames_total else 0.0,
+        "subject_coverage_pct": 100.0 * subject_frames / frames_total if frames_total else 0.0,
+        "subject_tracks": len(subject_ids),
+        "subject_ids": subject_ids,
+        "other_people_tracks": int(tracks_df["track_id"].nunique() - len(subject_ids)) if not tracks_df.empty else 0,
         "detections": int(len(tracks_df)),
         "tracks": int(tracks_df["track_id"].nunique()) if not tracks_df.empty else 0,
-        "longest_track_frames": longest_frames,
-        "longest_track_sec": longest_frames / fps,
+        "longest_track_frames": longest_frames, "longest_track_sec": longest_frames / fps,
         "pose_rows": int(len(pose_df)),
         "wrist_visible_pct": float(pose_diag.get("quality_wrist_visible_pct", 0.0)),
-        "entries": int((events_df["event_type"] == "entry").sum()) if not events_df.empty else 0,
-        "exits": int((events_df["event_type"] == "exit").sum()) if not events_df.empty else 0,
-        "cycles_total": int(track_rows["cycle_count"].sum()) if not track_rows.empty else 0,
-        "tracks_with_cycles": int(len(track_rows)),
-        "tracks_with_two_plus_cycles": int(len(multi)),
-        "median_cpm": float(cpm.median()) if len(cpm) else None,
-        "median_cpm_multi": float(multi["stroke_rate_cpm"].median()) if len(multi) else None,
-        "median_cv_multi": (float(multi["cycle_time_cv_pct"].dropna().median())
-                            if len(multi) and multi["cycle_time_cv_pct"].notna().any() else None),
+        "entries": int(((events_df["event_type"] == "entry") & events_df["track_id"].isin(subject_ids)).sum())
+                   if not events_df.empty else 0,
+        "exits": int(((events_df["event_type"] == "exit") & events_df["track_id"].isin(subject_ids)).sum())
+                 if not events_df.empty else 0,
+        "strokes_total": int(track_rows["stroke_count"].sum()) if not track_rows.empty else 0,
+        "tracks_with_strokes": int(len(track_rows)),
+        "tracks_multi": int(len(multi)),
+        "median_spm": float(spm_all.median()) if len(spm_all) else None,
+        "median_spm_multi": med("stroke_rate_spm", multi),
+        "median_cv_multi": med("arm_cycle_cv_pct", multi) if len(multi) and multi["arm_cycle_cv_pct"].notna().any()
+                           else med("stroke_interval_cv_pct", multi),
+        "phase_strokes": int(track_rows["phase_strokes_measured"].sum()) if not track_rows.empty else 0,
         "lengths_computed": int(metrics_diag.get("result_lengths_computed", 0)),
         "lengths_accepted": int(metrics_diag.get("result_lengths_accepted", 0)),
         "laps_computed": int(metrics_diag.get("result_laps_computed", 0)),
         "scale_method": calib.get("scale_method", "unknown"),
         "visible_span_m": float(calib.get("corner_span_m", {}).get("end_m", 0.0)),
         "scale_clamped": bool(calib.get("scale_estimate_clamped_to_prior", False)),
-        "metrics_df": metrics_df,
-        "track_rows": track_rows,
+        "metrics_df": metrics_df, "track_rows": track_rows, "strokes_df": strokes_df,
     }
 
 
-def rhythm_label(cv, cycles):
-    if cycles < 2 or cv is None or (isinstance(cv, float) and np.isnan(cv)):
-        return "single cycle"
+def rated_segments(rows):
+    """Segments with enough strokes and a tempo inside the swimmer's own
+    range -- the only ones pacing, range and rhythm statements draw on."""
+    if rows.empty:
+        return rows
+    ok = rows["stroke_count"] >= MIN_STROKES_STEADY
+    if "plausible" in rows:
+        ok &= rows["plausible"]
+    return rows[ok]
+
+
+def rhythm_label(cv, strokes):
+    if strokes < MIN_STROKES_STEADY or cv is None or (isinstance(cv, float) and np.isnan(cv)):
+        return "too few strokes"
     if cv <= STEADY_CV_PCT:
         return "steady"
     if cv <= UNEVEN_CV_PCT:
@@ -135,35 +217,85 @@ def rhythm_label(cv, cycles):
     return "uneven"
 
 
+def segment_cv(row):
+    cv = row.get("arm_cycle_cv_pct")
+    if cv is None or (isinstance(cv, float) and np.isnan(cv)):
+        cv = row.get("stroke_interval_cv_pct")
+    return cv
+
+
 def pacing_trend(multi):
-    """Early-vs-late tempo across the tracked swim, from segments with two
-    or more cycles. Returns (first_cpm, last_cpm, pct_change) or None."""
+    """Early-vs-late tempo across the tracked swim, from segments with
+    enough strokes. Returns (first_spm, last_spm, pct_change) or None."""
     if len(multi) < 2:
         return None
     first, last = multi.iloc[0], multi.iloc[-1]
-    if first["t_start"] == last["t_start"]:
+    if first["t_start"] == last["t_start"] or not first["stroke_rate_spm"]:
         return None
-    change = 100.0 * (last["stroke_rate_cpm"] - first["stroke_rate_cpm"]) / first["stroke_rate_cpm"]
-    return float(first["stroke_rate_cpm"]), float(last["stroke_rate_cpm"]), float(change)
+    change = 100.0 * (last["stroke_rate_spm"] - first["stroke_rate_spm"]) / first["stroke_rate_spm"]
+    return float(first["stroke_rate_spm"]), float(last["stroke_rate_spm"]), float(change)
+
+
+def arm_timing(strokes_df):
+    """Timing between the two arms: the interval from a camera-side stroke
+    to the next far-side stroke, against the interval from a far-side
+    stroke back to the camera-side one. In an even stroke the two
+    half-cycles match; a consistently longer one is the classic "gallop",
+    often tied to breathing to one side.
+
+    Built from stroke TIMES only, which is what this pipeline measures
+    reliably -- the same peaks gave tempo that agreed to within 2 cycles/min
+    across three different swimmers. Measured on DIVE_P022 / P023: each
+    direction's intervals scattered by 8-25% over 5-24 pairs, precise
+    enough to tell even from uneven. Returns None unless both directions
+    have MIN_ARM_PAIRS intervals (on DIVE_P004 the arms mostly could not be
+    told apart, so it reports nothing rather than guess)."""
+    if strokes_df.empty or "arm" not in strokes_df:
+        return None
+    nf, fn = [], []
+    for _, g in strokes_df.groupby("track_id"):
+        g = g.sort_values("t_peak")
+        for a, b in zip(g.itertuples(), list(g.itertuples())[1:]):
+            if a.interval_sec is None or np.isnan(a.interval_sec) or a.missed_after:
+                continue
+            if a.arm == "near" and b.arm == "far":
+                nf.append(a.interval_sec)
+            elif a.arm == "far" and b.arm == "near":
+                fn.append(a.interval_sec)
+    if len(nf) < MIN_ARM_PAIRS or len(fn) < MIN_ARM_PAIRS:
+        return None
+    nf, fn = np.array(nf), np.array(fn)
+    near_to_far, far_to_near = float(np.median(nf)), float(np.median(fn))
+    diff = near_to_far - far_to_near
+    pct = 100.0 * diff / ((near_to_far + far_to_near) / 2)
+    se = float(np.sqrt(np.var(nf) / len(nf) + np.var(fn) / len(fn)))
+    return {"near_to_far": near_to_far, "far_to_near": far_to_near, "n_near_to_far": len(nf),
+            "n_far_to_near": len(fn), "diff_pct": pct,
+            "uneven": abs(pct) >= ARM_TIMING_DIFF_PCT and abs(diff) > 2 * se}
 
 
 def observations(s, config):
-    """Coach-facing observations generated from the measured tempo and
-    rhythm. Factual first, then what is worth checking on the video; the
-    coach's own judgement of technique takes precedence over any of these."""
+    """Coach-facing observations generated from the measured tempo, rhythm,
+    pacing and arm timing. Factual first, then what is worth checking on
+    the video; the coach's own judgement of technique takes precedence."""
     rows = s["track_rows"]
-    multi = rows[rows["cycle_count"] >= 2] if not rows.empty else pd.DataFrame()
+    multi = rated_segments(rows) if not rows.empty else pd.DataFrame()
     bench = config["benchmarks"]["freestyle"]
     out = []
 
-    if s["cycles_total"] == 0:
-        return ["No complete stroke cycles could be timed in this clip, so there is no tempo picture to report. "
-                "A longer clip, or one where the swimmer stays in view for more of the length, would give one."]
+    if s["strokes_total"] == 0:
+        return ["No stroke could be timed in this clip, so there is no tempo picture to report. A longer "
+                "clip, or one where the swimmer stays in view for more of the length, would give one."]
 
-    # tempo
-    if s["median_cpm_multi"] is not None:
-        cpm = s["median_cpm_multi"]
-        lo, hi = multi["stroke_rate_cpm"].min(), multi["stroke_rate_cpm"].max()
+    # tempo -- benchmarks.freestyle is in CYCLES/min (both arms), so the
+    # comparison converts our strokes/min (one arm) down by half rather
+    # than comparing spm against a cpm range directly. Measured bug: a
+    # 56 strokes/min segment (28 cycles/min, clearly distance-style) was
+    # being matched against the 55-70 "sprint" range and reported as one.
+    if s["median_spm_multi"] is not None:
+        spm = s["median_spm_multi"]
+        cpm = spm / 2
+        lo, hi = multi["stroke_rate_spm"].min() / 2, multi["stroke_rate_spm"].max() / 2
         r50, r100 = bench["stroke_rate_50m"], bench["stroke_rate_100m"]
         if r50[0] <= cpm <= r50[1]:
             context = "a sprint-range tempo"
@@ -173,76 +305,99 @@ def observations(s, config):
             context = "a distance-style tempo, longer and slower than a sprint stroke"
         else:
             context = "a very high tempo"
-        out.append(f"Stroke tempo averaged {cpm:.0f} cycles per minute across the segments with two or more "
-                   f"cycles (individual segments ran {lo:.0f}–{hi:.0f}) -- {context}.")
-    else:
-        out.append(f"Only single-cycle segments were captured, at around {s['median_cpm']:.0f} cycles per minute. "
+        out.append(f"Stroke tempo averaged {cpm:.0f} full cycles per minute ({spm:.0f} strokes per minute, "
+                   f"counting each arm) across the segments with {MIN_STROKES_STEADY}+ strokes; individual "
+                   f"segments ran {lo:.0f}–{hi:.0f} cycles/min -- {context}.")
+    elif s["median_spm"] is not None:
+        out.append(f"Only short segments were captured, at around {s['median_spm']:.0f} strokes per minute. "
                    "Treat this as a snapshot of tempo rather than a measurement of the whole swim.")
 
     # rhythm
     if len(multi):
-        steady = multi[multi["cycle_time_cv_pct"] <= STEADY_CV_PCT]
-        uneven = multi[multi["cycle_time_cv_pct"] > UNEVEN_CV_PCT]
-        if len(steady):
-            spans = ", ".join(f"{r.t_start:.0f}–{r.t_end:.0f} s" for r in steady.itertuples())
-            out.append(f"Rhythm was steady at {spans}: cycle times varied by "
-                       f"{steady['cycle_time_cv_pct'].max():.0f}% or less from stroke to stroke.")
+        cvs = multi.apply(segment_cv, axis=1)
+        rated = multi[cvs.notna()]
+        steady = rated[cvs[rated.index] <= STEADY_CV_PCT]
+        uneven = rated[cvs[rated.index] > UNEVEN_CV_PCT]
+        if len(rated):
+            uneven_part = ("none were uneven" if not len(uneven)
+                           else f"{len(uneven)} {'was' if len(uneven) == 1 else 'were'} uneven")
+            out.append(f"Rhythm was steady in {len(steady)} of the {len(rated)} rated segments (arm-cycle time "
+                       f"varying by {STEADY_CV_PCT:.0f}% or less from stroke to stroke); {uneven_part}.")
         if len(uneven):
-            spans = ", ".join(f"{r.t_start:.0f}–{r.t_end:.0f} s ({r.cycle_time_cv_pct:.0f}%)" for r in uneven.itertuples())
-            out.append(f"Rhythm was uneven at {spans} -- one or more strokes there ran noticeably longer or "
-                       "shorter than the swimmer's own average. Worth reviewing that stretch of the video: "
-                       "a breath, a broken catch or a hurried recovery usually shows up here.")
+            spans = ", ".join(f"{r.t_start:.0f}–{r.t_end:.0f} s ({cvs[i]:.0f}%)" for i, r in zip(uneven.index, uneven.itertuples()))
+            out.append(f"The uneven stretch{'es' if len(uneven) > 1 else ''}: {spans} -- one or more strokes "
+                       "there ran noticeably longer or shorter than the swimmer's own average. Worth reviewing "
+                       "on the video: a breath, a broken catch or a hurried recovery usually shows up here.")
 
     # pacing
     trend = pacing_trend(multi)
     if trend:
         first, last, change = trend
         if change <= -PACING_CHANGE_PCT:
-            out.append(f"Tempo eased from about {first:.0f} to {last:.0f} cycles per minute between the earliest "
-                       f"and latest tracked segments ({change:+.0f}%). A drop like this late in a swim usually "
-                       "points either to fatigue or to a deliberately longer stroke -- the coach will know which "
-                       "was intended.")
+            out.append(f"Tempo eased from about {first/2:.0f} to {last/2:.0f} cycles per minute between the "
+                       f"earliest and latest tracked segments ({change:+.0f}%). A drop like this late in a swim "
+                       "usually points either to fatigue or to a deliberately longer stroke -- the coach will "
+                       "know which was intended.")
         elif change >= PACING_CHANGE_PCT:
-            out.append(f"Tempo built from about {first:.0f} to {last:.0f} cycles per minute across the tracked "
+            out.append(f"Tempo built from about {first/2:.0f} to {last/2:.0f} cycles per minute across the tracked "
                        f"swim ({change:+.0f}%), consistent with a finishing push or a stroke that shortened as "
                        "the swimmer tired -- worth checking which on the video.")
         else:
-            out.append(f"Tempo held within {abs(change):.0f}% from the earliest to the latest tracked segment "
-                       f"({first:.0f} to {last:.0f} cycles per minute) -- pacing was even.")
+            out.append(f"Pacing was even: tempo held within {max(1, round(abs(change)))}% from the earliest to the "
+                       f"latest tracked segment ({first/2:.0f} to {last/2:.0f} cycles per minute).")
 
-    # picture completeness, stated as scope rather than fault
-    if s["cycles_total"] < MIN_CYCLES_FOR_PICTURE:
-        out.append(f"{s['cycles_total']} cycles were timed cleanly in this clip, which is enough for a snapshot "
-                   "but not a full-swim picture; a longer or steadier clip would give a firmer read.")
+    # arm timing
+    at = arm_timing(s["strokes_df"])
+    if at:
+        if at["uneven"]:
+            longer = "camera-side to far-side" if at["diff_pct"] > 0 else "far-side to camera-side"
+            out.append(f"The two arms are not evenly spaced: the half-cycle from {longer} stroke runs "
+                       f"{abs(at['diff_pct']):.0f}% longer ({max(at['near_to_far'], at['far_to_near']):.2f} s "
+                       f"against {min(at['near_to_far'], at['far_to_near']):.2f} s). An uneven spacing like this "
+                       "-- a slight gallop -- often goes with breathing to one side or a pause in one arm's catch; "
+                       "worth checking on the video which arm is waiting.")
+        else:
+            out.append(f"The two arms are evenly spaced: camera-side to far-side and back take "
+                       f"{at['near_to_far']:.2f} s and {at['far_to_near']:.2f} s -- no gallop in the timing.")
+
+    if s["strokes_total"] < MIN_STROKES_FOR_PICTURE:
+        out.append(f"{s['strokes_total']} strokes were timed cleanly in this clip, which is enough for a "
+                   "snapshot but not a full-swim picture; a longer or steadier clip would give a firmer read.")
     return out
 
 
 def tempo_chart(track_rows, config, out_path):
     """Stroke tempo along the swim: one bar per tracked segment, placed at
     its time in the clip and as wide as the segment lasted; lighter where
-    only one cycle was captured. The shaded band is the reference range."""
-    rows = track_rows.dropna(subset=["stroke_rate_cpm"])
+    fewer than MIN_STROKES_STEADY strokes were captured."""
+    rows = track_rows.dropna(subset=["stroke_rate_spm"])
     if rows.empty:
         return None
     fig, ax = plt.subplots(figsize=(7.6, 3.1))
-    r100 = config["benchmarks"]["freestyle"]["stroke_rate_100m"]
+    # benchmarks.freestyle is in cycles/min (both arms); this chart is in
+    # strokes/min (one arm), so the band is doubled to plot on the same axis.
+    r100_cpm = config["benchmarks"]["freestyle"]["stroke_rate_100m"]
+    r100 = (r100_cpm[0] * 2, r100_cpm[1] * 2)
     ax.axhspan(r100[0], r100[1], color="#e6eef5", zorder=0)
-    ax.text(0.2, r100[1] - 1.2, "reference range (100 m freestyle)", fontsize=7.5, color="#6b7a83", va="top")
+    ax.text(0.2, r100[1] - 1.2, "reference range (100 m freestyle, doubled to strokes/min)",
+            fontsize=7.5, color="#6b7a83", va="top")
     for r in rows.itertuples():
         width = max(0.6, r.t_end - r.t_start)
-        ax.bar(r.t_start, r.stroke_rate_cpm, width=width, align="edge",
-               color="#2a78d6" if r.cycle_count >= 2 else "#b9d3f2", edgecolor="white", linewidth=0.8, zorder=2)
-        ax.text(r.t_start + width / 2, r.stroke_rate_cpm + 1.2,
-                f"{r.stroke_rate_cpm:.0f}", ha="center", va="bottom", fontsize=8, color="#333333")
+        strong = r.stroke_count >= MIN_STROKES_STEADY and getattr(r, "plausible", True)
+        ax.bar(r.t_start, r.stroke_rate_spm, width=width, align="edge",
+               color="#2a78d6" if strong else "#b9d3f2", edgecolor="white", linewidth=0.8, zorder=2)
+        ax.text(r.t_start + width / 2, r.stroke_rate_spm + 1.2, f"{r.stroke_rate_spm:.0f}",
+                ha="center", va="bottom", fontsize=8, color="#333333")
     ax.set_xlabel("time in clip (s)", fontsize=9)
-    ax.set_ylabel("stroke tempo\n(cycles / min)", fontsize=9)
-    ax.set_ylim(0, max(75, rows["stroke_rate_cpm"].max() * 1.18))
+    ax.set_ylabel("stroke tempo\n(strokes / min)", fontsize=9)
+    ax.set_ylim(0, max(80, rows["stroke_rate_spm"].max() * 1.18))
     ax.set_xlim(0, max(rows["t_end"].max() + 1, 5))
     ax.spines[["top", "right"]].set_visible(False)
     ax.grid(axis="y", color="#e1e0d9", linewidth=0.8, zorder=1)
     ax.set_axisbelow(True)
     ax.tick_params(labelsize=8)
-    ax.set_title("Stroke tempo through the swim  (lighter bars: one cycle only)", fontsize=10, loc="left")
+    ax.set_title(f"Stroke tempo through the swim  (lighter: fewer than {MIN_STROKES_STEADY} strokes, or outside the swimmer's own range)",
+                 fontsize=10, loc="left")
     fig.tight_layout()
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
@@ -308,12 +463,14 @@ def add_table(doc, header, rows, col_widths=None):
     return table
 
 
-def add_glance(doc, items):
-    """Four headline figures in a 2x2 grid of shaded cells."""
-    table = doc.add_table(rows=2, cols=2)
+def add_glance(doc, items, cols=3):
+    """Headline figures in a grid of shaded cells."""
+    n = len(items)
+    rows_n = (n + cols - 1) // cols
+    table = doc.add_table(rows=rows_n, cols=cols)
     table.style = "Table Grid"
-    for k, (label, value, sub) in enumerate(items[:4]):
-        cell = table.rows[k // 2].cells[k % 2]
+    for k, (label, value, sub) in enumerate(items):
+        cell = table.rows[k // cols].cells[k % cols]
         cell.text = ""
         p = cell.paragraphs[0]
         r = p.add_run(label.upper())
@@ -322,10 +479,10 @@ def add_glance(doc, items):
         p2 = cell.add_paragraph()
         r2 = p2.add_run(value)
         r2.bold = True
-        r2.font.size = Pt(18)
+        r2.font.size = Pt(17)
         p3 = cell.add_paragraph(sub)
         for rr in p3.runs:
-            rr.font.size = Pt(8.5)
+            rr.font.size = Pt(8)
             rr.font.color.rgb = RGBColor(0x4A, 0x5A, 0x63)
         tcPr = cell._tc.get_or_add_tcPr()
         shd = OxmlElement("w:shd")
@@ -350,7 +507,7 @@ def build_report(video_path, config, calibration_dir="data/calibration", output_
     s = summarise_run(video_path, config, calibration_dir)
     info = session_info(video_path)
     rows = s["track_rows"]
-    multi = rows[rows["cycle_count"] >= 2] if not rows.empty else pd.DataFrame()
+    multi = rated_segments(rows) if not rows.empty else pd.DataFrame()
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{stem_of(video_path)}_report.docx")
 
@@ -373,66 +530,93 @@ def build_report(video_path, config, calibration_dir="data/calibration", output_
         r.font.color.rgb = RGBColor(0x4A, 0x5A, 0x63)
 
     # --- at a glance ---
+    if s["median_spm_multi"] is not None:
+        tempo_value = f"{s['median_spm_multi']:.0f} /min"
+        tempo_sub = f"strokes per minute (≈ {s['median_spm_multi']/2:.0f} cycles/min), median over {s['tracks_multi']} segments"
+    elif s["median_spm"] is not None:
+        tempo_value = f"{s['median_spm']:.0f} /min"
+        tempo_sub = "strokes per minute, from short segments only -- indicative"
+    else:
+        tempo_value, tempo_sub = "—", "no strokes timed"
+    cv = s["median_cv_multi"]
+    rhythm_value = rhythm_label(cv, MIN_STROKES_STEADY).capitalize() if cv is not None else "—"
+    rhythm_sub = f"arm-cycle times vary by {cv:.0f}% (median across segments)" if cv is not None else "needs segments with 3+ strokes"
     trend = pacing_trend(multi)
     if trend:
         _, _, change = trend
-        trend_value = f"{change:+.0f}%"
-        trend_sub = ("tempo change, earliest to latest segment" if abs(change) >= PACING_CHANGE_PCT
-                     else "tempo held even across the swim")
+        if abs(change) >= PACING_CHANGE_PCT:
+            trend_value, trend_sub = f"{change:+.0f}%", "tempo change, earliest to latest segment"
+        else:
+            trend_value, trend_sub = "Even", f"tempo within {max(1, round(abs(change)))}% start to finish"
     else:
-        trend_value, trend_sub = "—", "needs two or more multi-cycle segments"
-    if s["median_cpm_multi"] is not None:
-        tempo_value = f"{s['median_cpm_multi']:.0f} /min"
-        tempo_sub = f"median over {s['tracks_with_two_plus_cycles']} segments with 2+ cycles"
-    elif s["median_cpm"] is not None:
-        tempo_value = f"{s['median_cpm']:.0f} /min"
-        tempo_sub = "from single-cycle segments only -- indicative"
+        trend_value, trend_sub = "—", "needs two or more segments with 3+ strokes"
+    at = arm_timing(s["strokes_df"])
+    if at is None:
+        arm_value, arm_sub = "—", "the two arms could not be told apart often enough to compare"
+    elif at["uneven"]:
+        arm_value, arm_sub = f"{abs(at['diff_pct']):.0f}% uneven", "one half-cycle between the arms runs longer"
     else:
-        tempo_value, tempo_sub = "—", "no complete cycles timed"
-    cv = s["median_cv_multi"]
-    rhythm_value = rhythm_label(cv, 2) if cv is not None else "—"
-    rhythm_sub = (f"cycle times vary by {cv:.0f}% (median across segments)" if cv is not None
-                  else "needs segments with 2+ cycles")
+        arm_value, arm_sub = "Even", "the two arms are evenly spaced -- no gallop"
+    tempo_sub += f" · {s['strokes_total']} strokes timed"
     add_glance(doc, [
         ("Stroke tempo", tempo_value, tempo_sub),
-        ("Rhythm", rhythm_value.capitalize(), rhythm_sub),
+        ("Rhythm", rhythm_value, rhythm_sub),
         ("Pacing", trend_value, trend_sub),
-        ("Cycles timed", f"{s['cycles_total']}", f"across {s['tracks_with_cycles']} tracked segments, "
-                                                 f"{s['coverage_pct']:.0f}% of the clip in view"),
-    ])
+        ("Arm timing", arm_value, arm_sub),
+    ], cols=2)
 
     # --- tempo through the swim ---
     doc.add_heading("Tempo through the swim", level=1)
     if rows.empty:
-        doc.add_paragraph("No complete stroke cycles were timed in this clip.")
+        doc.add_paragraph("No strokes were timed in this clip.")
     else:
         with tempfile.TemporaryDirectory() as tmp:
             chart = tempo_chart(rows, config, os.path.join(tmp, "tempo.png"))
             if chart:
                 doc.add_picture(chart, width=Inches(6.4))
-        caption(doc, "Each bar is one stretch of the swim where the swimmer was tracked continuously, placed "
-                     "at its time in the clip. Bar height is stroke tempo in cycles per minute; a cycle is one "
-                     "full arm cycle, timed from the hand's entry to its next entry.")
+        caption(doc, "Each bar is one stretch of the swim where the swimmer was tracked continuously, placed at "
+                     "its time in the clip. Bar height is stroke tempo in strokes per minute -- one stroke is one "
+                     "arm's recovery, so a full two-arm cycle is two strokes.")
         table_rows = []
         for r in rows.itertuples():
-            table_rows.append([
-                f"{r.t_start:.1f} – {r.t_end:.1f} s",
-                int(r.cycle_count),
-                fmt(r.stroke_rate_cpm, 0),
-                rhythm_label(getattr(r, "cycle_time_cv_pct", None), r.cycle_count).capitalize()
-                + (f"  ({r.cycle_time_cv_pct:.0f}%)" if r.cycle_count >= 2 and not np.isnan(r.cycle_time_cv_pct) else ""),
-            ])
-        add_table(doc, ["Segment", "Cycles", "Tempo (cycles/min)", "Rhythm (cycle-time variation)"],
+            cv_r = segment_cv(r._asdict())
+            label = rhythm_label(cv_r, r.stroke_count).capitalize()
+            if r.stroke_count >= MIN_STROKES_STEADY and cv_r is not None and not np.isnan(cv_r):
+                label += f"  ({cv_r:.0f}%)"
+            tempo_txt = fmt(r.stroke_rate_spm, 0)
+            if not getattr(r, "plausible", True):
+                tempo_txt += "  (check)"
+            table_rows.append([f"{r.t_start:.1f} – {r.t_end:.1f} s", int(r.stroke_count), tempo_txt, label])
+        add_table(doc, ["Segment", "Strokes", "Tempo (strokes/min)", "Rhythm (arm-cycle variation)"],
                   table_rows, col_widths=[1.5, 0.8, 1.5, 2.9])
-        caption(doc, "Rhythm reads the spread of cycle times within a segment: steady is 12% or less, "
-                     "uneven is above 20%. A segment with a single cycle cannot be rated.")
+        caption(doc, f"Rhythm reads the spread of each arm's cycle time within a segment: steady is "
+                     f"{STEADY_CV_PCT:.0f}% or less, uneven is above {UNEVEN_CV_PCT:.0f}%. A segment needs "
+                     f"{MIN_STROKES_STEADY} strokes before it is rated. A tempo marked (check) sits far outside "
+                     "the swimmer's own range and is more likely a tracking artefact than a real change of pace; "
+                     "it is left out of the pacing and range figures.")
+
+    # --- arm timing ---
+    doc.add_heading("Timing between the arms", level=1)
+    doc.add_paragraph(
+        "Consecutive strokes are alternate arms. The arm nearer the camera rises higher in the picture, which is "
+        "how the two are told apart -- so 'camera-side' is the swimmer's left or right depending on the direction "
+        "of swim, and the coach will know which. In an even stroke the time from one arm's stroke to the other's "
+        "is the same in both directions; a consistently longer gap one way is a gallop.")
+    if at:
+        add_table(doc, ["Half-cycle", "Intervals timed", "Median time (s)"], [
+            ["Camera-side stroke to far-side stroke", at["n_near_to_far"], fmt(at["near_to_far"], 2)],
+            ["Far-side stroke to camera-side stroke", at["n_far_to_near"], fmt(at["far_to_near"], 2)],
+        ], col_widths=[3.2, 1.3, 1.5])
+    else:
+        doc.add_paragraph(f"The two arms could not be told apart often enough in this clip (each direction needs "
+                          f"at least {MIN_ARM_PAIRS} timed intervals), so no comparison is reported.")
 
     # --- observations ---
     doc.add_heading("Observations", level=1)
     for text in observations(s, config):
         doc.add_paragraph(text, style="List Bullet")
-    caption(doc, "Generated from the measured tempo and rhythm. The coach's own reading of technique on the "
-                 "video takes precedence over any of these.")
+    caption(doc, "Generated from the measured tempo, rhythm, pacing and arm timing. The coach's own reading "
+                 "of technique on the video takes precedence over any of these.")
 
     # --- from the video ---
     with tempfile.TemporaryDirectory() as tmp:
@@ -448,8 +632,8 @@ def build_report(video_path, config, calibration_dir="data/calibration", output_
     doc.add_paragraph()
     caption(doc, f"Produced automatically from {s['video']}. Stroke timing is measured from the video's own "
                  f"timestamps at {s['fps']:.0f} frames per second; the swimmer was in view and tracked for "
-                 f"{s['coverage_pct']:.0f}% of the clip. This report covers tempo, rhythm and pacing only; "
-                 "distance and speed are not part of this version.")
+                 f"{s['subject_coverage_pct']:.0f}% of the clip. This report covers stroke tempo, rhythm, "
+                 "pacing and the timing between the arms; distance and speed are not part of this version.")
 
     doc.save(out_path)
     return out_path
