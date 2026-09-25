@@ -7,10 +7,10 @@
 # space -- events.py can compare a wrist straight to a lane's water line
 # with no further correction.
 #
-# Measures before assuming: the first thing reported is what percentage of
-# frames had a wrist visible above the confidence threshold. Below 70%, the
-# pretrained model isn't good enough and this stops rather than silently
-# producing bad numbers (CLAUDE.md section 8.2).
+# Reports how often it found the swimmer and how often a wrist was visible.
+# The quality gate those numbers used to feed (70% wrist visibility) now
+# measures what it stood in for -- the share of strokes actually timed --
+# in src/metrics.py (CLAUDE.md section 8.2 amendment).
 
 import argparse
 import os
@@ -22,7 +22,7 @@ from ultralytics import YOLO
 
 from src.detect_track import cache_path as detect_cache_path
 from src.detect_track import run_detect_track_cached
-from src.profiling import Timer, load_config
+from src.profiling import Timer, load_config, model_path
 
 # COCO keypoint order, used by YOLO11-pose
 KEYPOINT_NAMES = [
@@ -32,7 +32,6 @@ KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 ]
 
-WRIST_VISIBILITY_THRESHOLD_PCT = 70  # CLAUDE.md section 8.2's fixed gate
 
 
 def project_point(M, x, y):
@@ -85,8 +84,9 @@ def run_pose(video_path, config, calibration_dir="data/calibration"):
         raise RuntimeError(
             f"No track has at least {min_frames} frames -- nothing long enough for pose/event analysis.")
 
-    model = YOLO(config["pose"]["model"])
+    model = YOLO(model_path(config["pose"]["model"]))
     conf_threshold = config["pose"]["conf_threshold"]
+    person_conf = config["pose"]["person_conf_threshold"]
     batch_size = config["pose"]["batch_size"]
     half = config["pose"]["half_precision"]
 
@@ -107,11 +107,21 @@ def run_pose(video_path, config, calibration_dir="data/calibration"):
         if kpts is None or kpts.xy.shape[0] == 0:
             return  # the crop didn't yield a person -- occlusion, splash, etc.
 
-        # A tight crop should hold exactly the tracked swimmer, but if the
-        # model finds more than one, keep the most confident detection.
+        # The crop is cut around a box the tracker already says is the
+        # swimmer, so when the pose model returns several people (more likely
+        # at the low person threshold, and the padding can take in a
+        # neighbouring lane) keep the one that overlaps that box best, not
+        # simply the most confident.
         best = 0
         if result.boxes is not None and len(result.boxes) > 1:
-            best = int(np.argmax(result.boxes.conf.cpu().numpy()))
+            b = result.boxes.xyxy.cpu().numpy()
+            tx1, ty1, tx2, ty2 = row["x1"] - ox, row["y1"] - oy, row["x2"] - ox, row["y2"] - oy
+            iw = np.clip(np.minimum(b[:, 2], tx2) - np.maximum(b[:, 0], tx1), 0, None)
+            ih = np.clip(np.minimum(b[:, 3], ty2) - np.maximum(b[:, 1], ty1), 0, None)
+            inter = iw * ih
+            union = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]) + (tx2 - tx1) * (ty2 - ty1) - inter
+            best = int(np.argmax(inter / np.maximum(union, 1e-6)))
+        person_score = float(result.boxes.conf[best]) if result.boxes is not None and len(result.boxes) else np.nan
 
         xy = kpts.xy[best]
         confs = kpts.conf[best] if kpts.conf is not None else np.zeros(len(xy))
@@ -119,7 +129,7 @@ def run_pose(video_path, config, calibration_dir="data/calibration"):
 
         record = {
             "frame": row["frame"], "time_sec": row["time_sec"],
-            "track_id": row["track_id"], "lane": row["lane"],
+            "track_id": row["track_id"], "lane": row["lane"], "person_conf": person_score,
         }
         for i, name in enumerate(KEYPOINT_NAMES):
             px, py = xy[i, 0] + ox, xy[i, 1] + oy  # back to full-frame pixel space
@@ -137,7 +147,13 @@ def run_pose(video_path, config, calibration_dir="data/calibration"):
     def run_batch(crops, offsets, meta):
         if not crops:
             return
-        results = model.predict(crops, conf=conf_threshold, device=0, half=half, verbose=False)
+        # The person threshold, not the keypoint one: the pose model runs its
+        # own person detector on the crop first, and a swimmer scores low with
+        # stock COCO weights -- measured on DIVE_P004/P012/P022/P023, at 0.30
+        # it found nobody in 43-60% of crops that the tracker had already
+        # confirmed held the swimmer. Keypoints are still judged against
+        # conf_threshold downstream.
+        results = model.predict(crops, conf=person_conf, device=0, half=half, verbose=False)
         for row, (ox, oy), result in zip(meta, offsets, results):
             consume_result(row, ox, oy, result)
 
@@ -186,6 +202,7 @@ def run_pose(video_path, config, calibration_dir="data/calibration"):
     diagnostics = {
         "quality_wrist_visible_pct": wrist_visible_pct,
         "quality_wrist_visible_pct_of_successful_crops": (100.0 * wrist_visible_n / len(df)) if len(df) else 0.0,
+        "quality_person_found_pct": (100.0 * len(df) / attempted) if attempted else 0.0,
         "pose_rows_produced": len(df),
         "pose_detections_attempted": attempted,
         "pose_frames_available": len(frame_numbers),
@@ -203,7 +220,8 @@ def cache_path(video_path, config, cache_dir=None):
     upstream = os.path.splitext(os.path.basename(detect_cache_path(video_path, config)))[0]
     model = os.path.splitext(os.path.basename(config["pose"]["model"]))[0]
     conf = config["pose"]["conf_threshold"]
-    return os.path.join(cache_dir, f"{upstream}__pose_{model}__conf{conf}.csv")
+    person = config["pose"]["person_conf_threshold"]
+    return os.path.join(cache_dir, f"{upstream}__pose_{model}__conf{conf}__person{person}.csv")
 
 
 def run_pose_cached(video_path, config, calibration_dir="data/calibration"):
@@ -226,6 +244,7 @@ def run_pose_cached(video_path, config, calibration_dir="data/calibration"):
         else:
             wrist_visible_pct = 0.0
         return df, {"cached": True, "quality_wrist_visible_pct": wrist_visible_pct,
+                     "quality_person_found_pct": (100.0 * len(df) / attempted) if attempted else 0.0,
                      "pose_detections_attempted": attempted, "pose_rows_produced": len(df)}
 
     df, diagnostics = run_pose(video_path, config, calibration_dir)
@@ -246,16 +265,11 @@ def main():
     with Timer(timers, "time_pose_sec"):
         df, diagnostics = run_pose_cached(args.video, config)
 
-    pct = diagnostics["quality_wrist_visible_pct"]
     print(f"Processed in {timers['time_pose_sec']:.1f}s")
     print(diagnostics)
-    print(f"\nquality_wrist_visible_pct = {pct:.1f}%")
-    if pct >= WRIST_VISIBILITY_THRESHOLD_PCT:
-        print(f"{pct:.1f}% >= {WRIST_VISIBILITY_THRESHOLD_PCT}% -- the pretrained pose model is good enough, continue.")
-    else:
-        print(f"STOP: {pct:.1f}% < {WRIST_VISIBILITY_THRESHOLD_PCT}%. Do not continue past this without a decision "
-              f"from the user -- the fallback is annotating 300-500 frames and fine-tuning the pose model "
-              f"(CLAUDE.md section 8.2).")
+    print(f"\nperson found in {diagnostics.get('quality_person_found_pct', 0):.1f}% of tracked crops; "
+          f"wrist visible in {diagnostics['quality_wrist_visible_pct']:.1f}% of them. The quality gate is now "
+          f"stroke capture (CLAUDE.md section 8.2 amendment), reported by src.metrics.")
 
 
 if __name__ == "__main__":

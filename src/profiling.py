@@ -1,6 +1,7 @@
 # Times each pipeline stage and sends parameters, metrics, and artifacts to MLflow.
 
 import os
+import re
 import subprocess
 import time
 
@@ -17,6 +18,24 @@ def load_config(config_path="config.yaml"):
     # Every tunable number lives in one file, never hardcoded in a function
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
+
+
+STOCK_WEIGHTS = re.compile(r"^yolo(v\d+|11)[nslmx](-pose|-seg|-cls|-obb)?\.pt$")
+
+
+def model_path(path):
+    """The weights file a stage should load. Stock Ultralytics names
+    (yolo11x.pt, yolo11m-pose.pt, ...) download themselves on first use;
+    anything else is a local file, and *.pt is gitignored -- so on a fresh
+    clone the fine-tuned detector is simply missing, and Ultralytics then
+    fails with an unhelpful download error. Say what to do instead."""
+    if os.path.exists(path) or STOCK_WEIGHTS.match(os.path.basename(path)):
+        return path
+    raise FileNotFoundError(
+        f"Model weights '{path}' are not here. Weights are not stored in git (*.pt is ignored). "
+        f"Either copy the file into the project root, rebuild it with scripts/finetune_train.py "
+        f"(then copy its best.pt to '{path}'), or set detection.model in config.yaml to yolo11x.pt "
+        f"to run on the stock detector.")
 
 
 def git_commit_hash():

@@ -160,16 +160,27 @@ def detect_events_for_track(track_df, hand, water_line_points, config, fps, H):
         return None
 
     # Near / far arm by peak height: two clear groups mean alternate arms.
+    # The split is where it best separates two groups (Otsu: most variance
+    # between them), not at the single largest gap between sorted heights --
+    # a few in-between heights close that gap even when the alternation is
+    # plain: measured on DIVE_P023 once pose found more of the swimmer, a
+    # track reading 142, 78, 136, 73, 136, 70 ... with a handful of 90-110s
+    # went wholly unclassified under the largest-gap rule.
     amp = np.array([height[p] for p in kept])
     arm = ["unclassified"] * len(kept)
     if len(kept) >= 4:
-        order_amp = np.argsort(amp)
-        gaps = np.diff(amp[order_amp])
-        cut = int(np.argmax(gaps)) + 1
-        low, high = amp[order_amp[:cut]], amp[order_amp[cut:]]
-        if len(low) >= 2 and len(high) >= 2 and np.median(high) >= (1 + ev_cfg["arm_split_min_ratio"]) * np.median(low):
-            thresh = (low.max() + high.min()) / 2
-            arm = ["near" if a >= thresh else "far" for a in amp]
+        sorted_amp = np.sort(amp)
+        best_cut, best_var = None, -1.0
+        for cut in range(2, len(sorted_amp) - 1):
+            lo_, hi_ = sorted_amp[:cut], sorted_amp[cut:]
+            var = len(lo_) * len(hi_) * (hi_.mean() - lo_.mean()) ** 2
+            if var > best_var:
+                best_cut, best_var = cut, var
+        if best_cut is not None:
+            low, high = sorted_amp[:best_cut], sorted_amp[best_cut:]
+            if np.median(high) >= (1 + ev_cfg["arm_split_min_ratio"]) * np.median(low):
+                thresh = (low.max() + high.min()) / 2
+                arm = ["near" if a >= thresh else "far" for a in amp]
 
     def record(kind, j, extra=None):
         i = idx[j]

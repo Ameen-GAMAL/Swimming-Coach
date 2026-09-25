@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from src.profiling import load_config
+from src.profiling import load_config, model_path
 
 ASSUMED_TORSO_LENGTH_M = 0.48  # average adult shoulder-midpoint-to-hip-midpoint length
 LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP = 5, 6, 11, 12
@@ -338,8 +338,8 @@ def calibrate_video(video_path, config, calibration_dir="data/calibration"):
     # body size, since no real landmark is visible to calibrate it directly.
     H_placeholder = compute_homography(corners, 0.0, pool_length_m, lane_width_m)
 
-    detect_model = YOLO(config["detection"]["model"])
-    pose_model = YOLO(config["pose"]["model"])
+    detect_model = YOLO(model_path(config["detection"]["model"]))
+    pose_model = YOLO(model_path(config["pose"]["model"]))
     samples = sample_swimmer_boxes(video_path, detect_model, config)
     correction, scale_samples = estimate_length_scale(samples, pose_model, config, H_placeholder)
     if correction is None:

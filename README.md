@@ -1,9 +1,9 @@
 # Swimming Performance Tracking — Proof of Concept
 
-Takes a recorded video of a 25 m freestyle swim session, tracks each swimmer,
-detects hand-entry events, and calculates stroke rate, distance per cycle,
-clean-swim time, average speed, and cycle-time variation. Outputs a CSV plus
-an annotated video. See [CLAUDE.md](CLAUDE.md) for the full specification —
+Takes a recorded video of a freestyle swim in a 50 m pool, tracks the
+swimmer, and measures distance, speed and distance per stroke cycle (read
+off the lane rope's coloured bands), stroke tempo, rhythm and the timing
+between the arms. Outputs a CSV, an annotated video and a coach report. See [CLAUDE.md](CLAUDE.md) for the full specification —
 read it before changing anything under "Fixed decisions" (section 3).
 
 This is a proof of concept, not the production system.
@@ -42,6 +42,7 @@ time budget, not 5 minutes:
 |---|---|
 | Calibration (automatic, first run only) | ~1-2 min |
 | Detection & tracking | ~5-8 min |
+| Distance against the lane rope | ~1-3 min |
 | Pose | ~30-90 min (depends heavily on how much of the swimmer the detector finds — see "Known limitations") |
 | Events / Metrics | a few seconds |
 | Rendering the annotated video | ~2-4 min |
@@ -259,12 +260,13 @@ automatically via the cache if not).
 ```
 
 Runs YOLO11-pose on a crop around each tracked swimmer, applies the same
-camera-motion correction, and reports `quality_wrist_visible_pct` — the
-percentage of processed frames with a wrist visible above
-`pose.conf_threshold`. Below 70%, stop: the pretrained model isn't reliable
-enough and needs a decision from the user (CLAUDE.md section 8.2's
-fallback is annotating 300–500 frames and fine-tuning). Measured on real
-footage so far: **80.7%**.
+camera-motion correction, and reports how often it found the swimmer in
+the crop and how often a wrist was visible. Its person check uses
+`pose.person_conf_threshold` (0.05 — swimmers score low with stock weights),
+separate from the 0.30 keypoint threshold. The quality gate is **stroke
+capture** — the share of strokes swum that were timed, 70% minimum, reported
+by `src.metrics` and the app's Diagnostics (CLAUDE.md section 8.2
+amendment). Measured: 86-98% on P004/P012/P022/P023.
 
 ### Events
 
@@ -282,18 +284,32 @@ the camera). Skips tracks too short to contain a full stroke cycle
 plot per analysed track to `outputs/` — check this when a result looks
 wrong, per CLAUDE.md section 8.3.
 
+### Distance (lane rope)
+
+```
+.venv\Scripts\python.exe -m src.rope_odometry data\raw\<video-file>.MP4
+```
+
+Measures how far the filmed swimmer travels by counting the lane rope's
+navy/white bands as they pass the swimmer's head, on both sides of the
+swimmer (CLAUDE.md section 8.11). Band length `pool.rope_band_m` (0.39 m)
+was calibrated against the pool's red 5 m and mid-pool markings on two
+clips, which it then matches to within ~2%. Prints the distance, time and
+speed; caches its readings under `cache/rope/`.
+
 ### Metrics
 
 ```
 .venv\Scripts\python.exe -m src.metrics data\raw\<video-file>.MP4
 ```
 
-Splits each swimmer's position into lengths (turns detected via a
-minimum-swing zigzag, so tracking jitter isn't mistaken for a wall turn),
-computes the five client metrics inside the clean zone, applies the
-quality gate (never guesses — a rejected length's measurement columns are
-blank with a `rejection_reason`), adds provisional benchmark comparisons,
-and aggregates pairs of lengths into laps. Saves `outputs/<video>_metrics.csv`.
+For the filmed swimmer, one `swim` row per continuous rope-measured
+stretch (time, distance, speed, strokes, tempo, distance per cycle, and
+how much of it the rope was read directly) and `split` rows every 5 s
+inside it; a stretch where the rope was read too little keeps its timing
+but leaves distance and speed blank with a `rejection_reason`. Plus the
+per-track stroke-timing rows for everyone tracked. Saves
+`outputs/<video>_metrics.csv`.
 
 ### Rendering
 
@@ -301,9 +317,9 @@ and aggregates pairs of lengths into laps. Saves `outputs/<video>_metrics.csv`.
 .venv\Scripts\python.exe -m src.render data\raw\<video-file>.MP4
 ```
 
-Draws the grid, each tracked swimmer's box/ID/lane, their wrist, a flash
-at each hand entry, running counters, and a provisional watermark onto
-the video. Saves `outputs/<video>_annotated.mp4` (capped at 1920px wide
+Draws the filmed swimmer's box (other people muted), their wrist, a flash
+at each timed stroke, and a running panel of distance covered, current
+speed and running tempo onto the video. Saves `outputs/<video>_annotated.mp4` (capped at 1920px wide
 and 30fps — see `render.output_max_width`/`output_fps` in config.yaml —
 since this machine's OpenCV has no H.264 encoder and the fallback codec
 produces huge files at full source resolution/framerate).
@@ -316,11 +332,11 @@ produces huge files at full source resolution/framerate).
 
 Builds `outputs/<video>_report.docx` — a Word document written for the
 coach, about the filmed swimmer only (other people in the pool are left
-out): stroke tempo, rhythm consistency, pacing across the swim, the
-timing between the two arms (an even stroke vs a gallop), a tempo chart,
-three frames from the annotated video, and observations generated
-from the measured numbers. Deliberately leaves out diagnostics and every
-distance/speed figure (see CLAUDE.md section 8.10). Opens in Word or
+out): speed and distance per cycle, speed through the swim in 5-second
+splits, stroke tempo, rhythm consistency, pacing, the timing between the
+two arms (an even stroke vs a gallop), three frames from the annotated
+video, and observations generated from the measured numbers. Leaves out
+diagnostics (see CLAUDE.md section 8.10). Opens in Word or
 LibreOffice; export to PDF from there. The web page builds this at the end
 of every run and offers it for download in the Results tab.
 
@@ -343,8 +359,10 @@ Target: around 200 events across 3-4 videos (CLAUDE.md section 13).
 
 Opens a Gradio page at `http://127.0.0.1:7860`. Upload a video or pick one
 from `data/raw/`, click "Run analysis", and it runs the whole pipeline
-(calibrating first if needed) then shows the annotated video, the results
-table, and a download link for the coach report. Takes several minutes
+(calibrating first if needed) then shows the annotated video, a speed
+chart, a readable results table (each continuous swim and its 5-second
+splits), and downloads for the coach report and the full metrics CSV. A
+video uploaded during the session appears in the pick-list straight away. Takes several minutes
 depending on video length; a repeat run of the same video is near-instant
 since every stage is cached.
 
@@ -417,6 +435,9 @@ measurement. Two more, found while building detection/tracking (Phase 4):
    distance and speed numbers from this POC should be read as
    directionally useful, not as precise measurements, until real footage
    with a visible wall (or another true landmark) is available.
+   **Superseded:** distance and speed now come from the lane rope
+   (limitation 11, CLAUDE.md section 8.11), validated against the pool's
+   own red markings; the calibration only finds the pool area.
 
 8. **Detecting hand-entry and hand-exit crossings independently double-
    counted exits.** Signal jitter right at the water line, on a track long
@@ -448,6 +469,22 @@ measurement. Two more, found while building detection/tracking (Phase 4):
     *analysis*, not the review video, so this doesn't touch measurement
     accuracy. Result: ~365MB for the same clip (extrapolated from a 900-frame
     test render), a ~6x reduction.
+
+11. **Distance needs the lane rope behind the swimmer in view.** It is
+    read off the rope's bands; where the rope can't be followed for most of
+    a stretch, that stretch keeps its stroke timing but reports no distance
+    or speed. Band length is calibrated (0.39 m, not the 0.3 m first
+    assumed -- see config.yaml) against the red 5 m and mid-pool markings;
+    confirming it with a tape measure on the rope would tighten it. The
+    rope lies ~1.25 m beyond the swimmer, so distance is exact while the
+    camera keeps pace and off by roughly half a metre over 40 m when it
+    doesn't (P012). Absolute position along the pool is not read yet.
+
+12. **The fine-tuned detector's weights are not in git** (`*.pt` is
+    ignored). A fresh clone stops at detection with a message saying so:
+    copy `yolo11x_swimmer_finetuned_v1.pt` into the project root, rebuild it
+    with `scripts/finetune_train.py`, or set `detection.model` to
+    `yolo11x.pt` to run on the stock detector.
 
 ## Deferred (explicitly out of scope, not built)
 

@@ -3,7 +3,7 @@
 ## 1. What we are building
 
 A command-line tool plus a small web page that takes a recorded video of a
-25 m swimming pool, finds the swimmers, follows each one through the water,
+50 m swimming pool, finds the swimmers, follows each one through the water,
 detects when their hands enter and leave the water, and from that calculates
 how fast they swam, how many stroke cycles they took, and how far they
 travelled per cycle.
@@ -23,7 +23,8 @@ we have. It is not the production system.
 ### In scope
 - **Freestyle only.** No backstroke, breaststroke, or butterfly.
 - **Multi-lane.** Several swimmers visible at once, each tracked separately.
-- **25 m pool.**
+- **50 m pool** (user-confirmed; the original spec said 25 m). Red lane-rope
+  sections mark the last 5 m at each end.
 - **Post-session processing.** The video is a file on disk. Nothing is live.
 - Two measurements from the client spec: **stroke rate** and **distance per cycle**.
 - Plus: clean-swim time, average speed, cycle-time variation.
@@ -47,13 +48,13 @@ features that are out of scope. If a future need is obvious, write one line in
 | Decision | Value |
 |---|---|
 | Stroke | Freestyle |
-| Pool length | 25 m |
+| Pool length | 50 m (user-confirmed; corrected from 25 m) |
 | Lanes | Multiple, each swimmer assigned to a lane |
 | Frame sampling | **Every frame.** No frame skipping. |
 | Device | CUDA GPU on the local machine |
 | Model family | Ultralytics YOLO11 (detection + pose) |
 | Tracker | ByteTrack |
-| Pixel-to-metre conversion | Homography, fully automatic (see amendment below -- no wall is visible in this footage, so width is exact via lane ropes and length is an approximate anthropometric estimate) |
+| Distance measurement | Lane-rope odometry -- counting the rope's coloured bands as they pass the swimmer (section 8.11). The automatic homography below is kept only to find the pool area. |
 | Lap definition | Swimmer goes to the far wall and returns |
 | Experiment tracking | MLflow, local file store |
 | Version control | Git, initialised inside the project |
@@ -137,6 +138,14 @@ calibration in `src/calibrate.py`:
   user's role is to supply a video, nothing else.
 
 This changes the fixed decision in the table above and section 7 below.
+
+**Amendment (post-coach-report, user request to make distance, speed and
+distance per cycle trustworthy): distance is measured against the lane rope,
+section 8.11.** The homography-plus-camera-motion route above could not
+work with a camera walking alongside the swimmer, and the claim above that
+the ropes carry "no colour-coded distance markers" was wrong: they are red
+for the last 5 m at each end and at mid-pool, and those markings are what
+the new method was calibrated and validated against.
 
 **Amendment (investigated post-Phase 11, not adopted): motion-based
 swimmer localization to fix the weak-detector root cause.** The Phase 4
@@ -510,6 +519,38 @@ pose inference on them, not after -- `events.py` was going to discard them
 anyway, so paying for pose inference on a weak detector's many short track
 fragments (see section 3's Phase 4 amendment) was pure waste.
 
+**Amendment (user decision, after the rope-odometry work): the gate now
+measures stroke capture, and the pose model's person check was loosened.**
+Wrist visibility read 33-44% on DIVE_P004/P012/P022/P023, below 70%. Split
+apart, the loss was not the wrist: in 43-60% of crops the pose model found
+no person at all -- it runs its own person check on each crop, and that
+check shared the 0.30 keypoint threshold while a swimmer scores low with
+stock weights (the same weakness the detector threshold was lowered for).
+Where it did find the swimmer, the wrist was visible in 73-93% of frames.
+Two changes, both approved by the user:
+1. `pose.person_conf_threshold: 0.05`, separate from the 0.30 keypoint
+   threshold; of several people in a crop, the one best overlapping the
+   tracked box is kept (no longer simply the most confident).
+2. The gate measures what it stood in for: **stroke capture**, the share
+   of strokes swum that were timed (timed recovery peaks / time x tempo
+   x 2), `metrics.min_stroke_capture_pct: 70`, reported per swim and in
+   the app's Diagnostics. 70% wrist visibility could not be met above water
+   anyway: the hand is under the surface for most of each cycle.
+
+Measured before -> after (P022 / P004 / P012 / P023): swimmer found
+44->54 / 45->69 / 40->61 / 57->73%; wrist visible 33->39 / 33->48 /
+38->52 / 44->57%; stroke capture 84->89 / 71->86 / 92->98 / 97->98% (all
+pass 70%). Tempo moved 27.7->28.5 / 28.1->26.6 / 29.2->28.8 / 29.2->30.2
+cycles/min: within the measurement's own precision (tempo from consecutive
+strokes and from each arm's own cycle agree to ~1 cycle/min in every run;
+which strokes get detected shifts it by up to ~5%). Distance per cycle
+moved by at most 0.1 m.
+
+Side effect found and fixed (section 8.3): with more strokes found, the
+near/far arm split failed on DIVE_P023 (51 of 51 strokes classified before,
+22 of 53 after). Fine-tuning the pose model (the original fallback) was not
+needed for the gate; it remains the route to better wrist positions.
+
 ### 8.3 Events (`src/events.py`)
 For each swimmer, track the wrist nearest to the camera. Record which side it
 is (left or right) — with a side view the far arm is hidden by the body, so
@@ -636,7 +677,23 @@ entries and exits and is unchanged.
 `min_cycle_seconds` and `confidence_drop_window_frames` are gone; the
 Phase 6 state machine and its bug fix above are superseded.
 
+**Amendment (arm split, found with the section 8.2 pose change):** near and
+far arm are split at the height that best separates two groups (Otsu), not
+at the largest gap between sorted peak heights -- a few in-between heights
+close that gap even when the high/low alternation is plain. Consecutive
+strokes should alternate arms, so the share of classified neighbours that
+do is the check on the split: after the change 82% / 85% / 50% / 86%
+(P022 / P004 / P012 / P023). The coach report's arm timing needs 75%
+(`MIN_ALTERNATION_PCT` in report.py); below that the labels are closer to a
+coin toss than a measurement, and it says the arms could not be told apart
+(P012). Arm timing is now reported for P022, P004 and P023.
+
 ### 8.4 Lap splitting
+
+**Superseded by section 8.11** -- per-length and per-lap rows came from
+calibrated positions and are no longer produced. No clip in the dataset
+contains a turn; splitting a rope-measured swim at a turn is future work.
+
 The client's definition for this POC: a lap is complete when the swimmer
 reaches the far wall and comes back.
 
@@ -646,6 +703,10 @@ length** (one 25 m traverse), then also report them aggregated per lap. The
 CSV carries both.
 
 ### 8.5 Metrics (`src/metrics.py`)
+
+**Superseded by section 8.11** for distance, speed and distance per cycle,
+and the clean zone is gone with it (the clips start mid-pool, with no dive
+or push-off to exclude). Kept below as the original spec.
 
 Only count cycles whose entry and exit both fall inside the clean zone
 (default 5 m to 20 m of each length).
@@ -665,6 +726,12 @@ position from the homography. Distance per cycle is around 1.8–2.5 m — if we
 rounded position to 2.5 m strips, the number would be meaningless.
 
 ### 8.6 Quality gate
+
+**Superseded by section 8.11** for distance and speed: a swim is reported
+without them when the rope was read for less than
+`metrics.min_rope_measured_pct` of it. The `quality` config block below is
+no longer used and was removed.
+
 Do not report a score when any of these is true:
 - Mean wrist confidence across the cycle is below `min_confidence`
 - Fewer than `min_valid_cycles` complete cycles in the clean zone
@@ -721,22 +788,28 @@ data they need to supply next.
 
 ### 8.9 Rendering (`src/render.py`)
 Produce an annotated video showing:
-- The measurement grid drawn in perspective over the pool
-- Each swimmer's bounding box, ID, and lane
+- The filmed swimmer's box, and other people in the pool in a muted colour
 - The tracked wrist point
-- A marker flashing at each detected hand entry
-- Running counters: cycle count, current stroke rate, distance covered
-- A clear "PROVISIONAL" watermark on any benchmark comparison
+- A marker flashing at each timed stroke
+- A running panel for the filmed swimmer: distance covered and current
+  speed (from the rope, section 8.11) and running tempo (not a stroke
+  count: only the strokes the pose model times would be counted, 70-97%
+  of them on the tested clips, so a count drifts behind the real one)
 
-The grid is what lets the client confirm the distance maths with their own
-eyes. Make it clearly visible without hiding the swimmers.
+**Amendment (section 8.11):** the perspective metre grid and the per-track
+"m covered" counters are gone. Both came from the calibration, which is
+wrong with a walking camera -- the counters could run backwards or show
+metres never swum. The panel shows the same rope-measured distance the
+metrics and the report use.
 
 ### 8.10 The coach report (`src/report.py`) — added by user request
 
 A downloadable Word document (`outputs/<video>_report.docx`) built at the
 end of every run and offered in the app's Results tab. It is written for
-the coach, not the engineer: no diagnostics, no system caveats, no
-distance or speed figures.
+the coach, not the engineer: no diagnostics, no system caveats.
+**Amendment (section 8.11):** it now leads with speed and distance per
+cycle, and has a "Speed through the swim" section (5-second splits) and
+speed/distance-per-cycle observations, since those are now measured.
 
 **Only the filmed swimmer.** The pipeline tracks everyone it sees (the
 spec is multi-lane), but the report is about one swimmer, whom the camera
@@ -820,6 +893,62 @@ stage outputs; the app's summary line and Diagnostics tab read from it
 too, which is what stopped cached runs from showing "n/a" everywhere.
 
 ---
+
+### 8.11 Distance from the lane rope (`src/rope_odometry.py`)
+
+**Why.** The camera walks along the deck at water level beside the swimmer.
+No wall stays in view and the stands are too far away to give a scale, so
+the homography + camera-motion distance could not be trusted: on DIVE_P012
+all but one "length" was rejected, and the one kept covered 0.5 m of 15 m.
+
+**How.** The lane rope right behind the swimmer is a ruler lying in the
+water: navy and white bands of fixed length, the whole length of the pool.
+Per sampled frame (30 per second), on each side of the swimmer's box:
+1. find that rope -- at water level it passes behind the swimmer at about
+   head height -- and follow it outward in short chunks (it bends with the
+   lens and the perspective); the previous sample's curve seeds the search;
+2. read the navy/white pattern along it and locate each navy band;
+3. match each band to where it was a moment ago: its movement divided by
+   the local band spacing is the rope's movement in bands. No pixel scale
+   is needed, and perspective cancels band by band.
+The swimmer's progress is the head's movement across the picture minus
+the rope's, both in bands, times the band length.
+
+**Safeguards, each from a measured failure.** Float colours are judged
+against the water's own colour (the light differs by 2x between clips).
+A candidate rope must show navy AND white floats (sun glare and the stands'
+red seats reflected in the water look like floats otherwise). A sudden
+change in band spacing means the trace jumped to a farther rope -- dropped
+and re-searched (DIVE_P004, t=14-16 s); if it persists, the history was
+wrong instead (DIVE_P012's first 18 s were locked out before this). Single
+readings far from their neighbours are dropped. Both sides see the same
+rope, so where both read they must agree. Gaps up to 1 s are bridged at the
+neighbouring speed; longer gaps end a measured stretch.
+
+**Calibration and validation.** The user gave 0.3 m per band; the video
+says otherwise. DIVE_P012 runs from 1.0 m past the 45 m red-zone boundary
+(t=2.0 s) to 0.5 m short of the 5 m boundary (t=48.7 s) -- 38.5 m, hand-
+measured on full-resolution frames -- while 50.1 navy+white repeats pass:
+0.384 m bands. On DIVE_P022 the mid-pool red marker to the 5 m boundary
+(~20.5 m) spans 25.9 repeats: 0.397 m. `pool.rope_band_m` is 0.39, which
+puts both within ~2% of the landmark distances. A projective fit to the
+bands and the whole red zone up to the wall (DIVE_P012, t=4.5 s) gave
+0.49-0.59 m -- biased high by the lens's barrel distortion, but also well
+above 0.3. Worth confirming with a tape measure on the rope.
+
+Both sides of the swimmer agree to 1-4.5% on all four tested clips (median
+rope movement per sample, P004 / P012 / P022 / P023), with no turns in any
+of them. Measured: P022 34.9 m at 1.18 m/s; P012 ~41.8 m at 0.86 m/s;
+P004 36.8 m at 0.97 m/s.
+
+**Known limits.** The rope must be visible behind the swimmer; in the red
+end zones there are no navy bands to count, so the other side of the
+swimmer carries the measurement there (or the stretch is bridged). The
+rope sits ~1.25 m further from the camera than the swimmer, so distance is
+exact only while the camera keeps pace; the error is (depth ratio - 1) x
+how far the swimmer drifts relative to the camera -- about 0.5 m over a
+40 m swim on P012. Absolute position along the pool (distance from the
+wall) is not yet read from the red markings, though they are in view.
 
 ## 9. Performance
 
@@ -1073,5 +1202,5 @@ Ask the user before:
 - Producing a composite score, or any number presented as if the benchmarks
   were real
 
-If wrist visibility comes back below 70%, stop and report. Do not work around
-it silently.
+If stroke capture (section 8.2 amendment -- it replaced wrist visibility)
+comes back below 70%, stop and report. Do not work around it silently.

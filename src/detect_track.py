@@ -20,7 +20,7 @@ from ultralytics import YOLO
 from ultralytics.engine.results import Boxes
 from ultralytics.trackers.byte_tracker import BYTETracker
 
-from src.profiling import Timer, load_config
+from src.profiling import Timer, load_config, model_path
 
 
 def load_calibration(video_path, calibration_dir="data/calibration"):
@@ -523,7 +523,7 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
     keyframe_min_interval = cm_cfg["keyframe_min_interval_frames"]
     reanchor_inlier_floor = cm_cfg["keyframe_reanchor_inlier_floor"]
 
-    model = YOLO(config["detection"]["model"])
+    model = YOLO(model_path(config["detection"]["model"]))
     tracker = BYTETracker(build_tracker_args(config, fps), frame_rate=int(round(fps)))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -730,6 +730,37 @@ def run_detect_track(video_path, config, calibration_dir="data/calibration", _ma
         "color_blob_synthesized": color_blob_synthesized,
     }
     return df, diagnostics
+
+
+SUBJECT_MIN_PRIMARY_FRAC = 0.5   # share of a track's frames in which it is the largest box on screen
+SUBJECT_MIN_AREA_FRAC = 0.5      # its median box area relative to the largest-boxed substantial track
+
+
+def subject_track_ids(tracks_df, min_track_frames):
+    """The tracks that belong to the filmed swimmer, as opposed to other
+    people in the pool.
+
+    The pipeline tracks everyone it sees (the spec is multi-lane), but the
+    report is about one swimmer, and the camera walks alongside that
+    swimmer, keeping them the nearest -- largest -- person in shot. A track
+    is the subject's when it is the largest box on screen in most of its
+    frames AND its typical box is comparable in size to the largest
+    substantial track. Measured on DIVE_P004 before this existed: a
+    far-lane swimmer and a group at the pool edge were being timed and
+    their strokes folded into "the swimmer's" tempo. On P004, P022 and
+    P023 the excluded tracks sat at 22-45% of the subject's box size and
+    were the largest box in 1-27% of their frames; the subject's own
+    substantial tracks sat at 61%+ and 76%+."""
+    if tracks_df.empty:
+        return set()
+    d = tracks_df.assign(area=(tracks_df["x2"] - tracks_df["x1"]) * (tracks_df["y2"] - tracks_df["y1"]))
+    primary = d.loc[d.groupby("frame")["area"].idxmax(), "track_id"].value_counts()
+    g = d.groupby("track_id").agg(n=("frame", "size"), med_area=("area", "median"))
+    substantial = g[g["n"] >= min_track_frames]
+    ref = substantial["med_area"].max() if len(substantial) else g["med_area"].max()
+    primary_frac = primary.reindex(g.index).fillna(0) / g["n"]
+    keep = (primary_frac >= SUBJECT_MIN_PRIMARY_FRAC) & (g["med_area"] >= SUBJECT_MIN_AREA_FRAC * ref)
+    return set(g.index[keep])
 
 
 def cache_path(video_path, config, cache_dir=None, calibration_dir="data/calibration"):

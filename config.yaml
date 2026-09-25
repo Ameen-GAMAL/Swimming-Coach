@@ -4,11 +4,10 @@ video:
 pool:
   length_m: 50            # corrected from 25 (user-confirmed): this is a 50m competition pool. The old value was a second, independent scale error sitting underneath the calibration bug -- calibrate.py derives its length axis as pool_length_m * correction, so every distance was additionally halved relative to the intended premise.
   lanes: 6
+  rope_band_m: 0.39          # effective length of each navy or white band on the lane ropes (one navy+white repeat = 0.78 m). CALIBRATED against the pool's own markings, not the 0.3 m first assumed -- every distance and speed scales with it. DIVE_P012: from 1.0 m past the 45 m red-zone boundary (t=2.0 s) to 0.5 m short of the 5 m boundary (t=48.7 s) is 38.5 m, over which 50.1 repeats pass -> 0.384 m. DIVE_P022: the mid-pool (25 m) red marker to the 5 m boundary, ~20.5 m, spans 25.9 repeats -> 0.397 m. Mean 0.39; each clip then lands within ~2% of its landmark distance. Worth confirming with a tape measure on the rope itself.
+  rope_red_zone_m: 5.0       # the ropes are red for the last 5 m at each end (user-confirmed); red also marks the 15 m points (seen on DIVE_P022)
   lane_width_m: 2.5           # FINA standard lane width, needed for the calibration homography
   segment_size_m: 2.5         # Size of each grid strip drawn on the video
-  clean_zone_start_m: 5       # Skip the dive and the push-off
-  clean_zone_end_m: 20        # Skip the approach to the wall
-  min_turn_swing_m: 8.0       # How far the smoothed position must swing back before a turn is believed. Previously this borrowed lane_width_m (2.5) -- a LATERAL measure used as a longitudinal test, and far too small: measured on a real track, position jitter reached 1.6m between consecutive frames, so 2.5m of "swing" was ordinary noise and one ~25m traverse was chopped into 7 bogus "lengths" (one of them 2.6m in 0.13s). At 8.0m that same track resolves to a single length. Should scale with length_m if the pool ever changes.
 
 calibration:
   # Automatic calibration (no clicking -- see CLAUDE.md section 3 amendment).
@@ -154,7 +153,8 @@ detection:
 
 pose:
   model: yolo11m-pose.pt
-  conf_threshold: 0.30
+  conf_threshold: 0.30         # a KEYPOINT (wrist etc.) below this confidence is treated as not seen
+  person_conf_threshold: 0.05  # the pose model's own person check on each crop. The crop is already a tracked swimmer, and swimmers score low with stock COCO weights: at 0.30 (it used to share conf_threshold) nobody was found in 43-60% of crops (DIVE_P004/P012/P022/P023). The best-overlapping person is kept.
   batch_size: 16
   half_precision: true
 
@@ -171,10 +171,12 @@ events:
   min_phase_seconds: 0.15      # shortest pull or recovery duration accepted as real -- a freestyle recovery takes ~0.4-0.6s and the underwater phase (entry to the same arm's next exit) ~1.5-2s at a moderate tempo, so anything under this is a boundary error, not a stroke phase
   min_track_frames_for_analysis: 60  # tracks shorter than this can't show even one full stroke cycle -- skip rather than produce a near-empty plot
 
-quality:
-  min_confidence: 0.90
-  min_valid_cycles: 1  # relaxed from 3, by explicit user request, after measuring that neither available test clip ever contains 2 consecutive hand-entries in one continuously-tracked window -- the clip length runs out (or tracking drops) mid-cycle every time. Below this count, stroke_rate_cpm/distance_per_cycle_m are blanked with a data_quality_note explaining why (see metrics.py's apply_quality_gate); speed/clean-swim-time are position-based and are not gated on cycle count at all -- see CLAUDE.md section 8.5 amendment.
-  max_plausible_speed_ms: 3.0  # generously above elite freestyle (~2.2-2.5 m/s) -- a "length" whose implied speed exceeds this is turn-detection noise (a spurious zigzag from position jitter/a tracking discontinuity), not a real swim; rejected outright rather than reported as a partial observation. Needed once partial clean-zone coverage was accepted (see above): the old full-15m-crossing requirement filtered these out implicitly, since noise essentially never spans the whole clean zone.
+metrics:
+  min_stretch_sec: 5          # a continuous rope-measured stretch shorter than this is not reported as a swim
+  min_rope_measured_pct: 60   # a stretch whose rope readings cover less than this share (the rest bridged at the neighbouring speed) is reported without distance/speed
+  split_sec: 5                # pacing splits inside each stretch (~2 stroke cycles at these tempos)
+  min_split_strokes: 3        # tempo and distance per cycle in a split need at least this many strokes
+  min_stroke_capture_pct: 70  # quality gate: share of the strokes swum that were timed (timed recovery peaks / time x tempo x 2). Replaces the 70% wrist-visibility gate of CLAUDE.md section 8.2, which stood in for this and could not be met above water -- see the amendment there.
 
 benchmarks:
   provisional: true           # These are placeholder numbers, not real data
@@ -198,3 +200,13 @@ mlflow:
 cache:
   enabled: true
   directory: "./cache"
+
+rope_odometry:
+  # Distance swum measured against the lane rope behind the swimmer (see
+  # src/rope_odometry.py and CLAUDE.md section 8.11). Replaces the
+  # calibration + camera-motion distance, which could not work with a camera
+  # walking alongside the swimmer.
+  sample_hz: 30               # rope readings per second (every 4th frame at 120fps) -- the rope moves ~5% of a band between readings, far inside the +-35% a band can be matched over
+  side_agreement_repeats: 0.03  # both sides of the swimmer see the same rope; readings further apart than this (navy+white repeats per sample; ~0.05 is typical motion) are not trusted
+  max_step_repeats: 0.3         # a rope movement larger than this (repeats) between readings is a mismatch, not motion
+  max_bridge_sec: 1.0         # readings missing for up to this long are bridged with the neighbouring speed; longer gaps break the measurement
