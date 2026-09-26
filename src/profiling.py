@@ -13,6 +13,8 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 import mlflow
 import yaml
 
+from src import __version__
+
 
 def load_config(config_path="config.yaml"):
     # Every tunable number lives in one file, never hardcoded in a function
@@ -61,7 +63,7 @@ def start_run(config, run_name, tags):
     mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
     mlflow.set_experiment(config["mlflow"]["experiment_name"])
     run = mlflow.start_run(run_name=run_name)
-    mlflow.set_tags({**tags, "git_commit": git_commit_hash()})
+    mlflow.set_tags({**tags, "git_commit": git_commit_hash(), "pipeline_version": __version__})
     return run
 
 

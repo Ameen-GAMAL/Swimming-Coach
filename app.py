@@ -11,6 +11,7 @@ import shutil
 import gradio as gr
 import pandas as pd
 
+from src import __version__
 from src.calibrate import calibrate_video
 from src.detect_track import run_detect_track_cached
 from src.events import run_events_cached
@@ -118,6 +119,16 @@ def results_summary_md(s):
             f"Swimmer in view: **{s['subject_coverage_pct']:.0f}%** of the clip")
 
 
+def position_text(r):
+    # metres into the length, from the wall being swum away from
+    a, b = getattr(r, "start_position_m", None), getattr(r, "end_position_m", None)
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return "—"
+    txt = f"{a:.1f} → {b:.1f}"
+    u = getattr(r, "position_uncertainty_m", None)
+    return txt + (f"  (±{u:.1f})" if u is not None and not pd.isna(u) else "")
+
+
 def results_table(metrics_df):
     """The filmed swimmer's results, one row per continuous swim and one per
     5-second split, with readable headers and rounded values. The raw
@@ -139,6 +150,7 @@ def results_table(metrics_df):
         out.append({
             "Part": part,
             "From (s)": _fmt(r.start_sec, 1), "To (s)": _fmt(r.end_sec, 1),
+            "Pool position (m)": position_text(r),
             "Distance (m)": _fmt(r.distance_m, 1),
             "Speed (m/s)": _fmt(r.average_speed_ms, 2),
             # cycles swum = time x tempo: the stroke count itself only covers
@@ -162,6 +174,15 @@ def capture_line(s):
             f"-- {verdict} the {gate}% gate (CLAUDE.md section 8.2)")
 
 
+def position_line(s):
+    fixes = s.get("position_fixes") or []
+    if not fixes:
+        return "not placed -- no red rope marking (5 m zone or mid-pool marker) was seen close enough to the swimmer"
+    return "; ".join(f"placed from {f['markings']}, to within ±{f['uncertainty_m']:.1f} m"
+                     + ("" if f["uncertainty_m"] <= CONFIG["pool_position"]["max_uncertainty_m"] else " -- too uncertain, not reported")
+                     for f in fixes)
+
+
 def diagnostics_summary_md(s):
     return f"""
 ### Detection & tracking
@@ -171,10 +192,11 @@ def diagnostics_summary_md(s):
 - Filmed swimmer in view: {s['subject_coverage_pct']:.1f}% of frames -- longest continuous track {s['longest_track_frames']} frames ({s['longest_track_sec']:.1f}s)
 
 ### Distance (lane rope)
-- Rope readings used directly: {s['rope_measured_pct']:.0f}% of samples (the rest bridged at the neighbouring speed, up to {CONFIG['rope_odometry']['max_bridge_sec']:.0f} s at a time)
+- Rope readings used directly: {s['rope_measured_pct']:.0f}% of samples -- {s['rope_texture_pct']:.0f}% of them from the float-disc pattern where the navy/white bands couldn't be counted (red end zones, splash); the rest bridged at the neighbouring speed, up to {CONFIG['rope_odometry']['max_bridge_sec']:.0f} s at a time
 - Samples where the two sides of the swimmer disagreed (discarded): {s['rope_side_disagreements']}
 - Swims measured: {s['swims_accepted']} of {s['swims_computed']} continuous stretches (a stretch needs {CONFIG['metrics']['min_rope_measured_pct']}% of its rope readings)
 - Band length used: {CONFIG['pool']['rope_band_m']:.2f} m per navy or white band, calibrated against the pool's 5 m and 25 m markings
+- Position along the pool: {position_line(s)}
 
 ### Pose and stroke capture
 - Strokes timed: {capture_line(s)}
@@ -289,7 +311,7 @@ CUSTOM_CSS = """
 """
 
 with gr.Blocks(title="Swimming Performance Tracking (POC)") as demo:
-    gr.Markdown("# 🏊 Swimming Performance Tracking — Proof of Concept")
+    gr.Markdown(f"# 🏊 Swimming Performance Tracking — Proof of Concept  ·  v{__version__}")
     gr.Markdown(
         "Upload a freestyle swim video (side view, filmed along the pool at water level), or pick one already "
         "in `data/raw/`, then run the analysis. Processing takes several minutes depending on video length -- "

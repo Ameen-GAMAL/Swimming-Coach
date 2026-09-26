@@ -48,6 +48,12 @@ SEARCH_UP_PX, SEARCH_DOWN_PX = 170, 40                # around head height
 FOLLOW_TOL_PX = 14                                    # rope row search either side of the predicted row, chunk to chunk
 MAX_TRACE_PX = 1500
 PROFILE_HALF_PX = 8
+CONTINUITY_BLOCKS, CONTINUITY_MIN_OK = 6, 5                # open water below a starting rope in 5 of 6 pieces (_open_below)
+TEXTURE_MAX_SHIFT_PX = 60                              # the rope moves ~5-15 px between readings at 30 per second
+TEXTURE_REACH_PX = 900                                 # disc pattern compared over this much rope next to the swimmer
+TEXTURE_MIN_OVERLAP_PX = 300
+TEXTURE_MIN_QUALITY = 0.6                              # peak normalised correlation for a disc-pattern match to count
+BELOW_MAX_FLOAT_PX, BELOW_DEPTH_PX = 40, 26            # floats end within 40 px below the line; the next 26 rows must be open water (_open_below)
 HEAD_FROM_LEAD = 0.18                                 # the head sits ~18% of the box length behind its leading edge (pose, DIVE_P022: median 0.176)
 
 
@@ -109,6 +115,32 @@ def _rope_like(n, w, r, allow_red=True):
     return score, ok
 
 
+def _open_below(band_from_line, coloured_from_line, blocks=CONTINUITY_BLOCKS, min_ok=CONTINUITY_MIN_OK,
+                max_cover=0.10):
+    """The rope we want is the one nearest the camera, so directly below it
+    in the picture lies the swimmer's own lane: open water. A line cutting
+    diagonally through the farther ropes -- which pack into a near-solid
+    carpet of floats on a steep oblique view (DIVE_P010 at t=22/38/42 s) --
+    scores as well as a real rope, but has floats below it too.
+    `band_from_line` holds the float pixels (any colour) from the candidate
+    line downward, `coloured_from_line` the navy and red ones only. The
+    floats' own lower half is skipped first (it runs 10-25 px below the
+    centre line depending on how close the rope is), then the next
+    BELOW_DEPTH_PX rows are split into pieces, nearly all of which must be
+    clear of navy and red floats. White is not counted there: the bow wave
+    and splash ahead of the swimmer are white too (DIVE_P022's leading side
+    failed this test in 6 of 14 sampled frames when it was)."""
+    rows = band_from_line.mean(axis=1)
+    end = next((k for k in range(len(rows)) if rows[k] < 0.3), None)
+    if end is None or end > BELOW_MAX_FLOAT_PX:
+        return False
+    below = coloured_from_line[end + 4:end + 4 + BELOW_DEPTH_PX]
+    if len(below) < BELOW_DEPTH_PX // 2:
+        return True
+    pieces = np.array_split(below.mean(axis=0), blocks)
+    return sum(float(p.mean()) <= max_cover for p in pieces) >= min_ok
+
+
 def _first_point(img, ref, x_edge, y_seed, direction):
     """The rope nearest the camera (lowest in the picture) near head height,
     beside the box edge, searched over a range of slopes. A real rope row
@@ -123,20 +155,27 @@ def _first_point(img, ref, x_edge, y_seed, direction):
         if xa < 0 or xb > W:
             continue
         pad = int(FIRST_SLOPES.max() * FIRST_CHUNK_PX / 2) + 2
-        ya, yb = int(max(0, y_seed - SEARCH_UP_PX - pad)), int(min(H, y_seed + SEARCH_DOWN_PX + pad))
+        ya, yb = int(max(0, y_seed - SEARCH_UP_PX - pad)), int(min(H, y_seed + SEARCH_DOWN_PX + pad + BELOW_MAX_FLOAT_PX + 4 + BELOW_DEPTH_PX))
         if yb - ya < 2 * pad + 5:
             continue
-        nv, wt, rd = (m.astype(np.float32) for m in float_masks(img[ya:yb, xa:xb], ref))
+        nv, wt, rd = float_masks(img[ya:yb, xa:xb], ref)
+        # one array, one gather per slope: bit 1 navy, 2 white, 4 red
+        packed = nv.astype(np.uint8) | (wt.astype(np.uint8) << 1) | (rd.astype(np.uint8) << 2)
         cols = np.arange(xb - xa) - (xb - xa) / 2
         rows = np.arange(yb - ya)
         cidx = np.broadcast_to(np.arange(xb - xa)[None, :], (len(rows), xb - xa))
-        inside = (rows >= pad) & (rows < yb - ya - pad)
+        inside = (rows >= pad) & (rows < yb - ya - pad - BELOW_MAX_FLOAT_PX - 4 - BELOW_DEPTH_PX)
+        reach = BELOW_MAX_FLOAT_PX + 4 + BELOW_DEPTH_PX
         for sl in FIRST_SLOPES:
-            idx = np.clip((rows[:, None] + np.round(sl * cols)[None, :]).astype(int), 0, yb - ya - 1)
-            tot, ok = _rope_like(*_row_scores(nv[idx, cidx], wt[idx, cidx], rd[idx, cidx], 4), allow_red=False)
-            for i in range(1, len(tot) - 1):
-                if inside[i] and ok[i] and tot[i] >= tot[i - 1] and tot[i] >= tot[i + 1]:
-                    cands.append(((xa + xb) / 2, ya + i, float(tot[i]), off, float(sl)))
+            idx = np.clip(rows[:, None] + np.round(sl * cols).astype(int)[None, :], 0, yb - ya - 1)
+            g = packed[idx, cidx]
+            tot, ok = _rope_like(*_row_scores(g & 1, (g >> 1) & 1, (g >> 2) & 1, 4), allow_red=False)
+            peak = np.zeros(len(tot), bool)
+            peak[1:-1] = inside[1:-1] & ok[1:-1] & (tot[1:-1] >= tot[:-2]) & (tot[1:-1] >= tot[2:])
+            for i in np.flatnonzero(peak):
+                band = g[i:i + reach]
+                if _open_below(band > 0, (band & 5) > 0):
+                    cands.append(((xa + xb) / 2, ya + int(i), float(tot[i]), off, float(sl)))
     if not cands:
         return None
     top = max(c[2] for c in cands)
@@ -219,6 +258,56 @@ def rope_profile(img, coef, lo, hi, ref, half=PROFILE_HALF_PX):
     return xs, nv / k, wt / k, rd / k
 
 
+def rope_texture(img, coef, lo, hi, half=PROFILE_HALF_PX):
+    """Brightness along the rope with its slow variation removed: the pattern
+    of individual float discs. Unlike the navy/white bands it is there on the
+    solid red end zones too, where there are no bands to count."""
+    xs = np.arange(lo, hi)
+    ys = np.polyval(coef, xs).round().astype(int)
+    y0, y1 = max(0, ys.min() - half - 1), min(img.shape[0], ys.max() + half + 2)
+    g = cv2.cvtColor(img[y0:y1, lo:hi], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    cols = xs - lo
+    prof = np.zeros(len(xs), np.float32)
+    for dy in range(-half, half + 1):
+        prof += g[np.clip(ys + dy - y0, 0, g.shape[0] - 1), cols]
+    prof /= 2 * half + 1
+    return xs, prof - _smooth(prof, 41)
+
+
+def texture_step(prev, cur, x_edge, direction, max_shift=TEXTURE_MAX_SHIFT_PX, reach=TEXTURE_REACH_PX):
+    """Pixel shift d of the rope's disc pattern between two samples, such that
+    cur(x) ~ prev(x - d), over the stretch of rope next to the swimmer; with
+    the peak normalised correlation as its quality. (None, 0) if too little
+    rope overlaps or the match is weak."""
+    (xp, gp), (xc, gc) = prev, cur
+    near_lo = x_edge - reach if direction < 0 else x_edge
+    near_hi = x_edge if direction < 0 else x_edge + reach
+    lo = max(xp[0], xc[0], near_lo) + max_shift
+    hi = min(xp[-1], xc[-1], near_hi) - max_shift
+    if hi - lo < TEXTURE_MIN_OVERLAP_PX:
+        return None, 0.0
+    c = gc[(xc >= lo) & (xc < hi)]
+    c = c - c.mean()
+    cn = float(np.sqrt((c * c).sum()))
+    if cn == 0:
+        return None, 0.0
+    scores = np.full(2 * max_shift + 1, -1.0)
+    for k, d in enumerate(range(-max_shift, max_shift + 1)):
+        q = gp[(xp >= lo - d) & (xp < hi - d)]
+        if len(q) != len(c):
+            continue
+        q = q - q.mean()
+        den = cn * float(np.sqrt((q * q).sum()))
+        if den > 0:
+            scores[k] = float((c * q).sum()) / den
+    k = int(np.argmax(scores))
+    if scores[k] < TEXTURE_MIN_QUALITY or k in (0, len(scores) - 1):
+        return None, float(max(scores[k], 0.0))
+    a, b, cc = scores[k - 1], scores[k], scores[k + 1]
+    den = a - 2 * b + cc
+    return (k - max_shift) + (0.5 * (a - cc) / den if den else 0.0), float(b)
+
+
 def _runs(mask, min_len, close_gap=0):
     m = mask.astype(np.int8)
     e = np.flatnonzero(np.diff(np.r_[0, m, 0]))
@@ -261,6 +350,31 @@ def red_runs(xs, rd, min_px=40):
     return [(int(xs[a]), int(xs[b - 1]), a == 0, b == len(xs)) for a, b in _runs(_smooth(rd, 15) > 0.35, min_px)]
 
 
+def ruler(bands, x_edge, direction):
+    """Column -> rope repeats counted outward from the box edge, read off the
+    navy bands on this side. Consecutive bands are one repeat apart, or more
+    where one was missed (a gap ~2x the local spacing); outside the bands the
+    nearest spacing extrapolates. Perspective is handled band by band, the
+    same way the odometry handles it. None with fewer than two bands."""
+    if len(bands) < 2:
+        return None
+    pts = sorted((direction * (c - x_edge), sp) for c, sp in bands)
+    u = [q[0] for q in pts]
+    sp = [q[1] for q in pts]
+    ids = [u[0] / sp[0]]
+    for j in range(1, len(u)):
+        ids.append(ids[-1] + max(1, round((u[j] - u[j - 1]) / min(sp[j - 1], sp[j]))))
+
+    def at(x):
+        v = direction * (x - x_edge)
+        if v <= u[0]:
+            return ids[0] - (u[0] - v) / sp[0]
+        if v >= u[-1]:
+            return ids[-1] + (v - u[-1]) / sp[-1]
+        return float(np.interp(v, u, ids))
+    return at
+
+
 def band_step(prev, cur):
     """Rope movement between two samples in repeats (navy+white; +ve = toward
     +x), as the median over navy bands of (movement / local navy-to-navy
@@ -282,7 +396,7 @@ def band_step(prev, cur):
 def subject_boxes(tracks_df, config):
     """One box per frame for the filmed swimmer: the largest box among the
     subject's tracks (the subject can be split over several track ids)."""
-    ids = subject_track_ids(tracks_df, config["events"]["min_track_frames_for_analysis"])
+    ids = subject_track_ids(tracks_df)
     d = tracks_df[tracks_df["track_id"].isin(ids)].copy()
     d["area"] = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"])
     return d.sort_values("area").groupby("frame").tail(1).set_index("frame").sort_index()
@@ -304,6 +418,7 @@ def run_rope_odometry(video_path, config, calibration_dir="data/calibration"):
     f0, f1 = int(boxes.index.min()), int(boxes.index.max())
     cap.set(cv2.CAP_PROP_POS_FRAMES, f0)
     prev_bands = {"L": None, "R": None}
+    prev_tex = {"L": None, "R": None}
     prior = {"L": None, "R": None}
     period_hist = {"L": [], "R": []}
     rejections = {"L": 0, "R": 0}
@@ -314,6 +429,7 @@ def run_rope_odometry(video_path, config, calibration_dir="data/calibration"):
             continue
         if fr not in boxes.index:
             prev_bands, prior = {"L": None, "R": None}, {"L": None, "R": None}
+            prev_tex = {"L": None, "R": None}
             continue
         _, img = cap.retrieve()
         x1, y1, x2, y2 = (float(v) for v in boxes.loc[fr, ["x1", "y1", "x2", "y2"]])
@@ -326,10 +442,18 @@ def run_rope_odometry(video_path, config, calibration_dir="data/calibration"):
             if tr is None and prior[side] is not None:
                 tr = trace_rope(img, ref, x_edge, y_seed, direction, None)
             if tr is None:
-                prior[side], prev_bands[side] = None, None
+                prior[side], prev_bands[side], prev_tex[side] = None, None, None
                 continue
             coef, lo, hi = tr
             xs, nv, wt, rd = rope_profile(img, coef, lo, hi, ref)
+            # disc-pattern movement, in pixels: the fallback where bands can't be
+            # matched (red end zones, bands hidden by splash or glare)
+            tex = rope_texture(img, coef, lo, hi)
+            if prev_tex[side] is not None:
+                d_px, q = texture_step(prev_tex[side], tex, x_edge, direction)
+                if d_px is not None:
+                    rec[f"tex_px_{side}"], rec[f"tex_q_{side}"] = d_px, q
+            prev_tex[side] = tex
             bands = navy_bands(xs, nv, wt, rd)
             if bands:
                 nearest = min(bands, key=lambda b: abs(b[0] - x_edge))[1]
@@ -345,7 +469,9 @@ def run_rope_odometry(video_path, config, calibration_dir="data/calibration"):
                 if len(hist) >= 5 and not (0.7 <= nearest / np.median(hist) <= 1.4):
                     rejections[side] += 1
                     if rejections[side] < 8:
-                        prior[side], prev_bands[side] = None, None
+                        prior[side], prev_bands[side], prev_tex[side] = None, None, None
+                        rec.pop(f"tex_px_{side}", None)
+                        rec.pop(f"tex_q_{side}", None)
                         rec[f"rejected_{side}"] = True
                         continue
                     hist = []
@@ -358,9 +484,21 @@ def run_rope_odometry(video_path, config, calibration_dir="data/calibration"):
                 step, n = band_step(prev_bands[side], bands)
                 rec[f"step_{side}"], rec[f"matched_{side}"] = step, n
             prev_bands[side] = bands
-            reds = [r for r in red_runs(xs, rd)]
+            reds = red_runs(xs, rd)
             if reds:
                 rec[f"red_{side}"] = ";".join(f"{a}:{b}:{int(ca)}{int(cb)}" for a, b, ca, cb in reds)
+                # Red sections of the rope are the pool's own distance markings
+                # (pool_position): record each one's near and far ends in repeats
+                # outward from the box edge, and whether either end ran off the
+                # traced rope (then that end was not actually seen).
+                r_at = ruler(bands, x_edge, direction)
+                if r_at is not None:
+                    marks = []
+                    for a, b, clip_lo, clip_hi in reds:
+                        near, far = (b, a) if direction < 0 else (a, b)
+                        near_clip, far_clip = (clip_hi, clip_lo) if direction < 0 else (clip_lo, clip_hi)
+                        marks.append(f"{r_at(near):.3f}:{r_at(far):.3f}:{int(near_clip)}{int(far_clip)}")
+                    rec[f"marks_{side}"] = ";".join(marks)
         rows.append(rec)
     cap.release()
     df = pd.DataFrame(rows)
@@ -379,9 +517,14 @@ def swimmer_progress(rope_df, config):
         return rope_df
     df = rope_df.copy()
     for side in "LR":
-        for col in (f"step_{side}", f"matched_{side}", f"period_px_{side}"):
+        for col in (f"step_{side}", f"matched_{side}", f"period_px_{side}", f"tex_px_{side}", f"tex_q_{side}"):
             if col not in df:
                 df[col] = np.nan
+        # disc-pattern movement in repeats, with this side's recent band spacing
+        # (it changes slowly, and carries over into a red zone from the bands
+        # seen before it)
+        side_period = df[f"period_px_{side}"].rolling(61, center=True, min_periods=1).median().ffill().bfill()
+        df[f"tex_step_{side}"] = df[f"tex_px_{side}"] / side_period
     # a single reading far from its neighbours is a mismatch (splash over the
     # rope, a band lost to glare), not a change of speed: Hampel filter per side
     for side in "LR":
@@ -401,6 +544,22 @@ def swimmer_progress(rope_df, config):
     step[only_r] = df.loc[only_r, "step_R"]
     step[step.abs() > cfg["max_step_repeats"]] = np.nan
     df["side_disagree"] = both & ~agree
+    # where no band reading survived, fall back to the disc pattern (Hampel-
+    # filtered the same way; both sides averaged when they agree)
+    tex = pd.Series(np.nan, index=df.index)
+    for side in "LR":
+        col = df[f"tex_step_{side}"]
+        med = col.rolling(15, center=True, min_periods=5).median()
+        col = col.where((col - med).abs() <= np.maximum(0.015, 0.4 * med.abs()))
+        df[f"tex_step_{side}"] = col
+    tl, tr_ = df["tex_step_L"], df["tex_step_R"]
+    tboth = tl.notna() & tr_.notna() & ((tl - tr_).abs() <= cfg["side_agreement_repeats"])
+    tex[tboth] = ((tl + tr_) / 2)[tboth]
+    tex[tl.notna() & tr_.isna()] = tl
+    tex[tr_.notna() & tl.isna()] = tr_
+    use_tex = step.isna() & tex.notna() & (tex.abs() <= cfg["max_step_repeats"])
+    step[use_tex] = tex[use_tex]
+    df["measured_texture"] = use_tex
     df["measured"] = step.notna()
     # heading from the rope's overall drift: rope moving +x means swimming toward -x
     heading = -1.0 if np.nanmedian(step) > 0 else 1.0
@@ -423,6 +582,7 @@ def swimmer_progress(rope_df, config):
     step_b[missing & (run_len > max_gap)] = np.nan
     frame_gap = dt > 1.5 * dt.median()
     step_b[frame_gap] = np.nan          # the rope's movement across a hole in the detections is unknown
+    df["period_px"] = period
     df["step_repeats"] = step_b
     move = df["head_x"].diff() / period - step_b          # repeats per sample
     speed = (move / dt).rolling(31, center=True, min_periods=5).median()
@@ -432,6 +592,173 @@ def swimmer_progress(rope_df, config):
     df["progress_m"] = (move.fillna(0.0) * 2 * config["pool"]["rope_band_m"]).cumsum()
     df["heading"] = heading
     return df
+
+
+def _marking_sightings(st, swum, cfg, rep_m, length, zone, ahead_side):
+    """Every sighting of a red rope marking in one stretch, with the swimmer
+    position it implies under each reading it allows. A long red run (or one
+    running off the traced rope) can only be an end zone. A SHORT red run
+    with both ends seen is ambiguous: the ~1 m mid-pool marker, or a partial
+    glimpse of an end zone (broken up by splash or glare) -- measured at the
+    start of DIVE_P012, where glimpses of the zone behind the swimmer read
+    as "markers" and put the swimmer 20 m out. Both readings are kept here;
+    _consensus picks. Returns rows (side, t, swum, reading, pos)."""
+    out = []
+    for i, r in st.iterrows():
+        for side in "LR":
+            marks = r.get(f"marks_{side}")
+            if not isinstance(marks, str) or not marks:
+                continue
+            edge = r["x1"] if side == "L" else r["x2"]
+            # repeats from the box edge back to the head. The rope is hidden
+            # there, so the offset is converted with the band spacing just
+            # outside the box -- which the wide-angle lens shrinks relative to
+            # the middle of the picture. Measured over 2,207 sightings on eight
+            # clips: that made this offset read 14% long, putting readings
+            # behind the swimmer 0.1-1.0 m above readings ahead of it on every
+            # clip. head_offset_scale corrects it.
+            head_back = abs(r["head_x"] - edge) / r["period_px"] * cfg["head_offset_scale"]
+            ahead = side == ahead_side
+            zone_x = length - zone if ahead else zone
+            for m in marks.split(";"):
+                near, far, flags = m.split(":")
+                near, far = float(near), float(far)
+                if flags[0] == "1":
+                    continue                         # its near end is hidden behind the swimmer
+                span_m = (far - near) * rep_m
+                readings = [(f"{zone:g} m zone {'ahead' if ahead else 'behind'}", zone_x, (near + head_back) * rep_m)]
+                if flags[1] == "0" and span_m <= cfg["marker_max_len_m"]:
+                    readings.append(("mid-pool marker", length / 2.0, ((near + far) / 2 + head_back) * rep_m))
+                for name, x_mark, d in readings:
+                    if d <= cfg["max_landmark_distance_m"]:
+                        out.append((side, float(r["time_sec"]), float(swum[i]), name,
+                                    x_mark - d if ahead else x_mark + d))
+    return pd.DataFrame(out, columns=["side", "t", "swum", "reading", "pos"])
+
+
+def _episodes(obs, cfg):
+    """Group sightings into episodes (same side, contiguous in time) and,
+    per reading, keep the episodes that behave like a marking FIXED on the
+    rope: the start position each sighting implies (position minus distance
+    swum) must stay constant. Something that travels with the camera
+    instead -- red floats on a farther rope, a reflection -- drifts:
+    measured on DIVE_P004, a red run that approached at 0.4 repeats/s while
+    the swimmer covered 15 m. Returns rows (episode, reading, origin, n)."""
+    out = []
+    for side, g in obs.groupby("side"):
+        g = g.sort_values("t")
+        times = g["t"].drop_duplicates()
+        ep_of_t = (times.diff() > cfg["episode_gap_sec"]).cumsum()
+        g = g.assign(ep=g["t"].map(dict(zip(times, ep_of_t))))
+        for (ep, reading), e in g.groupby(["ep", "reading"]):
+            if len(e) < cfg["min_landmark_samples"]:
+                continue
+            origin = e["pos"] - e["swum"]
+            if float(e["swum"].max() - e["swum"].min()) >= 1.0:
+                if abs(float(np.polyfit(e["swum"], origin, 1)[0])) > cfg["max_episode_drift"]:
+                    continue
+            med = float(origin.median())
+            if float((origin - med).abs().median()) > cfg["max_episode_scatter_m"]:
+                continue
+            out.append((f"{side}{ep}", reading, med, len(e), float(e["swum"].median())))
+    return pd.DataFrame(out, columns=["episode", "reading", "origin", "n", "swum"])
+
+
+def _consensus(eps, tol):
+    """The start position most sightings agree on: each episode may be read
+    one of its allowed ways; pick the value that the most sightings support
+    (within tol) with one reading per episode, and each episode's reading
+    closest to it."""
+    best, best_support = None, -1
+    for o in eps["origin"]:
+        near = eps[(eps["origin"] - o).abs() <= tol]
+        support = near.groupby("episode")["n"].max().sum()
+        if support > best_support:
+            best, best_support = o, support
+    chosen = eps.assign(dev=(eps["origin"] - best).abs())
+    chosen = chosen[chosen["dev"] <= tol].sort_values("dev").groupby("episode").head(1)
+    return chosen
+
+
+def pool_position(progress, config):
+    """Where the swimmer is along the pool: metres into the length, measured
+    from the wall they are swimming away from.
+
+    The ropes carry the pool's own distance markings: red for the last
+    `pool.rope_red_zone_m` at each end, and a short red marker at mid-pool.
+    Each time one is in view on the traced rope, counting the bands between
+    it and the swimmer's head places the swimmer exactly at that moment:
+      - an end zone BEHIND the swimmer: its boundary is `zone` m into the length;
+      - an end zone AHEAD: its boundary is `length - zone` m in;
+      - the mid-pool marker: its centre is `length / 2` m in.
+    The rope distance carries that position through the rest of the stretch.
+    Consistent sighting episodes (_episodes) each give an estimate of where
+    the stretch started, under each reading a red run allows; the value most
+    sightings agree on wins (_consensus), and the agreeing episodes are
+    averaged, weighted by sightings.
+
+    The error estimate (`pool_position_err_m`, per moment) is honest about
+    what was checked: the largest deviation of an agreeing substantial
+    episode from the result (floor `base_uncertainty_m`), plus `drift_pct`
+    of the distance swum outside the stretch the markings cover -- the rope
+    distance is good to ~2-4%, so position error grows away from them.
+    Checked on DIVE_P012's hand-measured positions: 0.5 m off where it
+    claims +-0.9, 1.4 m off where it claims +-1.4. Positions are reported
+    only where the error is within `max_uncertainty_m`.
+
+    The scale is NOT refitted from the markings. Tried: two markings ~19 m
+    apart (DIVE_P012: the zone behind and the mid-pool marker), each placed
+    to +-0.5 m, pin the scale only to +-5% -- the fit came out +4.6% and
+    moved P012's hand-checked end position from +1.0 m to +1.9 m off.
+
+    Returns (progress with `pool_position_m`, list of per-stretch fixes)."""
+    cfg = config["pool_position"]
+    rep_m = 2 * config["pool"]["rope_band_m"]
+    length, zone = config["pool"]["length_m"], config["pool"]["rope_red_zone_m"]
+    df = progress.copy()
+    df["pool_position_m"] = np.nan
+    df["pool_position_err_m"] = np.nan
+    if df.empty:
+        return df, []
+    heading = float(df["heading"].iloc[0])
+    ahead_side = "L" if heading < 0 else "R"
+    swum = heading * df["progress_m"]            # distance swum, increasing along the stretch
+    stretch = df["gap_before"].cumsum()
+    fixes = []
+    for sid, st in df.groupby(stretch):
+        obs = _marking_sightings(st, swum, cfg, rep_m, length, zone, ahead_side)
+        eps = _episodes(obs, cfg) if len(obs) else pd.DataFrame()
+        if eps.empty:
+            continue
+        chosen = _consensus(eps, cfg["consensus_tol_m"])
+        w = chosen["n"].to_numpy(float)
+        origin = float(np.average(chosen["origin"], weights=w))
+        s0, s1 = float(swum[st.index].min()), float(swum[st.index].max())
+        # error at each moment: how well the substantial episodes agree (a
+        # handful of sightings is too noisy to set it), plus drift for the
+        # distance swum outside the stretch they cover
+        big = chosen[chosen["n"] >= cfg["substantial_episode_n"]]
+        big = big if len(big) else chosen.nlargest(1, "n")
+        agree = max(cfg["base_uncertainty_m"], float((big["origin"] - origin).abs().max()))
+        lo_cov, hi_cov = float(big["swum"].min()), float(big["swum"].max())
+        sw = swum[st.index]
+        err = agree + cfg["drift_pct"] / 100.0 * np.maximum(lo_cov - sw, 0).clip(lower=0)             + cfg["drift_pct"] / 100.0 * np.maximum(sw - hi_cov, 0).clip(lower=0)
+        pos = origin + sw
+        # a position past a wall is impossible: its excess is error (e.g. the
+        # rope distance wobbling backwards while the swimmer is still on the
+        # wall before a push-off, DIVE_P027) and it is clipped to the wall
+        excess = np.maximum(np.maximum(-pos, pos - length), 0.0)
+        err = err + excess
+        pos = pos.clip(0.0, float(length))
+        ok = err <= cfg["max_uncertainty_m"]
+        kinds = chosen.groupby("reading")["n"].sum()
+        fixes.append({"stretch": int(sid), "origin_m": origin, "uncertainty_m": float(err[ok].max()) if ok.any() else float(err.min()),
+                      "placed_pct": 100.0 * float(ok.mean()),
+                      "markings": ", ".join(f"{k} (x{n})" for k, n in kinds.items()),
+                      "episodes_used": len(chosen), "episodes_seen": int(eps["episode"].nunique())})
+        df.loc[st.index[ok.to_numpy()], "pool_position_m"] = pos[ok]
+        df.loc[st.index[ok.to_numpy()], "pool_position_err_m"] = err[ok]
+    return df, fixes
 
 
 def cache_path(video_path, config, cache_dir=None):

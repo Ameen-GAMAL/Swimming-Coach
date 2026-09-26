@@ -24,7 +24,7 @@ from src.events import pick_tracked_hand, run_events_cached
 from src.metrics import subject_strokes
 from src.pose import run_pose_cached
 from src.profiling import Timer, load_config
-from src.rope_odometry import run_rope_odometry_cached, swimmer_progress
+from src.rope_odometry import pool_position, run_rope_odometry_cached, swimmer_progress
 
 SUBJECT_COLOUR = (0, 220, 255)
 OTHER_COLOUR = (150, 150, 150)
@@ -33,13 +33,15 @@ TEMPO_STROKES = 6          # running tempo over the last this-many timed strokes
 
 
 def progress_lookup(progress):
-    """Per-frame distance covered so far and current speed for the filmed
-    swimmer, from the rope measurement (None outside the measured span)."""
+    """Per-frame distance covered so far, current speed and position in the
+    length for the filmed swimmer, from the rope measurement (None outside
+    the measured span; position None where the markings didn't place it)."""
     if progress.empty:
         return None
     t = progress["time_sec"].to_numpy()
     p = progress["progress_m"].to_numpy()
     p = np.abs(p - p[0])
+    pos = progress["pool_position_m"].to_numpy() if "pool_position_m" in progress else np.full(len(t), np.nan)
 
     def at(time_sec):
         if time_sec < t[0] or time_sec > t[-1]:
@@ -47,7 +49,8 @@ def progress_lookup(progress):
         dist = float(np.interp(time_sec, t, p))
         t0 = max(t[0], time_sec - SPEED_WINDOW_SEC)
         speed = (dist - float(np.interp(t0, t, p))) / (time_sec - t0) if time_sec - t0 > 0.5 else None
-        return dist, speed
+        where = float(np.interp(time_sec, t, pos))
+        return dist, speed, (None if np.isnan(where) else where)
     return at
 
 
@@ -57,11 +60,11 @@ def render_video(video_path, config, calibration_dir="data/calibration", output_
     events_df, _ = run_events_cached(video_path, config, calibration_dir)
     rope_df, _ = run_rope_odometry_cached(video_path, config, calibration_dir)
 
-    subject_ids = subject_track_ids(tracks_df, config["events"]["min_track_frames_for_analysis"])
+    subject_ids = subject_track_ids(tracks_df)
     strokes = subject_strokes(events_df, pose_df, subject_ids, config)
     stroke_frames = np.sort(strokes["frame_peak"].to_numpy()) if not strokes.empty else np.array([], dtype=int)
     halves = strokes.sort_values("frame_peak")["half_cycle_sec"].to_numpy() if not strokes.empty else np.array([])
-    progress_at = progress_lookup(swimmer_progress(rope_df, config))
+    progress_at = progress_lookup(pool_position(swimmer_progress(rope_df, config), config)[0])
 
     hand_by_track = {tid: pick_tracked_hand(g) for tid, g in pose_df.groupby("track_id")}
     pose_lookup = {(int(r.frame), r.track_id): r for r in pose_df.itertuples()}
@@ -129,7 +132,9 @@ def render_video(video_path, config, calibration_dir="data/calibration", output_
         prog = progress_at(t) if progress_at else None
         lines = [f"Tempo: {tempo:.0f} cycles/min" if tempo else "Tempo: --"]
         if prog is not None:
-            dist, speed = prog
+            dist, speed, where = prog
+            if where is not None:
+                lines.insert(0, f"In the length: {where:.1f} m")
             lines.insert(0, f"Distance: {dist:.1f} m")
             lines.insert(1, f"Speed: {speed:.2f} m/s" if speed is not None else "Speed: --")
         pad = int(14 * scale)

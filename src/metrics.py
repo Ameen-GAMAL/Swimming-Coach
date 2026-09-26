@@ -18,11 +18,12 @@ import os
 import numpy as np
 import pandas as pd
 
+from src import __version__
 from src.detect_track import run_detect_track_cached, subject_track_ids
 from src.events import pick_tracked_hand, run_events_cached
 from src.pose import run_pose_cached
 from src.profiling import Timer, load_config
-from src.rope_odometry import run_rope_odometry_cached, swimmer_progress
+from src.rope_odometry import pool_position, run_rope_odometry_cached, swimmer_progress
 
 
 def cycle_mean_confidence(pose_track_df, hand, start_frame, end_frame):
@@ -257,9 +258,25 @@ def stroke_capture(n_timed, duration_sec, cpm):
     return min(100.0, 100.0 * n_timed / (duration_sec * cpm / 60.0 * 2))
 
 
-def swim_rows(progress, strokes, config):
+def _position_at(st, t):
+    p = st["pool_position_m"]
+    if p.isna().all():
+        return None
+    ok = p.notna()
+    return float(np.interp(t, st.loc[ok, "time_sec"], p[ok]))
+
+
+def _position_err(st, t0, t1):
+    e = st.loc[(st["time_sec"] >= t0) & (st["time_sec"] <= t1), "pool_position_err_m"].dropna()
+    return float(e.max()) if len(e) else None
+
+
+def swim_rows(progress, strokes, config, fixes=()):
     """One `swim` row per continuous rope-measured stretch of the filmed
-    swimmer, and `split` rows every metrics.split_sec inside it."""
+    swimmer, and `split` rows every metrics.split_sec inside it. Where the
+    red rope markings placed the stretch (pool_position), each row also
+    carries where in the length it starts and ends."""
+    fix_by_stretch = {f["stretch"]: f for f in fixes}
     cfg = config["metrics"]
     bench = config["benchmarks"]["freestyle"]
     rows = []
@@ -267,7 +284,8 @@ def swim_rows(progress, strokes, config):
         return rows
     stretch_id = progress["gap_before"].cumsum()
     n_stretch = 0
-    for _, st in progress.groupby(stretch_id):
+    for sid, st in progress.groupby(stretch_id):
+        fix = fix_by_stretch.get(int(sid))
         if len(st) > 1:
             st = st.iloc[1:] if st["gap_before"].iloc[0] else st
         if len(st) < 2:
@@ -295,6 +313,9 @@ def swim_rows(progress, strokes, config):
             "distance_per_cycle_vs_benchmark": None if reason else compare_to_benchmark(dpc, bench["distance_per_cycle"]),
             "rope_measured_pct": measured,
             "stroke_capture_pct": stroke_capture(n_str, dur, cpm),
+            "start_position_m": _position_at(st, t0), "end_position_m": _position_at(st, t1),
+            "position_uncertainty_m": _position_err(st, t0, t1),
+            "position_markings": fix["markings"] if fix else "",
             "rejection_reason": reason,
         }
         rows.append(row)
@@ -322,6 +343,8 @@ def swim_rows(progress, strokes, config):
                 "stroke_count": n_s, "cycle_rate_cpm": c,
                 "distance_per_cycle_m": (v * 60.0 / c) if (v and c) else None,
                 "rope_measured_pct": 100.0 * float(sp["measured"].mean()),
+                "start_position_m": _position_at(st, float(a)), "end_position_m": _position_at(st, float(b)),
+                "position_uncertainty_m": _position_err(st, float(a), float(b)),
                 "rejection_reason": "",
             })
     return rows
@@ -334,10 +357,10 @@ def run_metrics(video_path, config, calibration_dir="data/calibration"):
     rope_df, _ = run_rope_odometry_cached(video_path, config, calibration_dir)
     video = os.path.basename(video_path)
 
-    subject_ids = subject_track_ids(tracks_df, config["events"]["min_track_frames_for_analysis"])
+    subject_ids = subject_track_ids(tracks_df)
     strokes = subject_strokes(events_df, pose_df, subject_ids, config)
-    progress = swimmer_progress(rope_df, config)
-    rows = [dict(r, video=video) for r in swim_rows(progress, strokes, config)]
+    progress, fixes = pool_position(swimmer_progress(rope_df, config), config)
+    rows = [dict(r, video=video) for r in swim_rows(progress, strokes, config, fixes)]
 
     # Per-track stroke timing for everyone tracked (time-based only).
     for track_id, _ in tracks_df.groupby("track_id"):
@@ -352,12 +375,16 @@ def run_metrics(video_path, config, calibration_dir="data/calibration"):
             rows.append(track_row)
 
     df_out = pd.DataFrame(rows)
+    if not df_out.empty:
+        df_out["pipeline_version"] = __version__
     swims = df_out[df_out["row_type"] == "swim"] if not df_out.empty else df_out
     diagnostics = {
         "result_swims_computed": int(len(swims)),
         "result_swims_accepted": int((swims["rejection_reason"] == "").sum()) if len(swims) else 0,
         "rope_measured_pct": float(100 * progress["measured"].mean()) if not progress.empty else 0.0,
+        "rope_texture_pct": float(100 * progress["measured_texture"].mean()) if not progress.empty else 0.0,
         "rope_side_disagreements": int(progress["side_disagree"].sum()) if not progress.empty else 0,
+        "position_fixes": fixes,
     }
     return df_out, diagnostics
 

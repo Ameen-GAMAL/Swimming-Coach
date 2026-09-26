@@ -949,6 +949,66 @@ exact only while the camera keeps pace; the error is (depth ratio - 1) x
 how far the swimmer drifts relative to the camera -- about 0.5 m over a
 40 m swim on P012. Absolute position along the pool (distance from the
 wall) is not yet read from the red markings, though they are in view.
+**Superseded -- see "Position along the pool" below.**
+
+**Rope out of view (user request).** Two failure modes, each fixed:
+- *No bands to count.* The last 5 m at each end are solid red, and splash or
+  glare hides bands elsewhere; readings died exactly where starts and
+  finishes happen. Where bands can't be matched on a side, the rope's
+  movement now comes from the pattern of individual float discs
+  (brightness along the traced rope, slow variation removed), found by
+  correlation with the previous sample and converted to repeats with that
+  side's recent band spacing. Validated on DIVE_P022, wherever both
+  readings exist: disc pattern minus bands = +0.6% (left) / -1.8% (right)
+  of the typical step, scatter ~5-13% per reading, averaging out.
+- *Wrong rope.* On a steep oblique view (DIVE_P010) the farther ropes pack
+  into a near-solid carpet of floats, and a line cutting diagonally through
+  it scored as well as a real rope. A starting rope must now have open water
+  directly below it -- the swimmer's own lane -- with no navy or red floats
+  in 5 of 6 pieces (white is ignored there: the bow wave ahead of the
+  swimmer is white too).
+
+**Subject selection fix (found on DIVE_P027).** The filmed swimmer's size
+reference is now the dominant track (largest box on screen in the most
+frames), not the largest-boxed track of 60+ frames: a 0.7 s burst of very
+large boxes at the start of P027 had excluded the swimmer's own 34 s track
+(352 of 5,749 frames attributed to the swimmer instead of 5,208). The six
+other tested clips select exactly the same tracks either way.
+
+**Position along the pool (user request).** `pool_position()` places the
+swimmer in metres into the length, from the wall they are swimming away
+from, using the ropes' red markings: an end zone behind the swimmer has its
+boundary 5 m in, one ahead 45 m in, and the mid-pool marker's centre 25 m
+in. Each red run on the traced rope is located in repeats from the box
+edge by counting navy bands (`ruler()`), plus the head-to-edge offset. The
+rope distance then carries the position through the stretch. Measured
+problems, each handled:
+- *Ambiguous runs.* A short red run with both ends seen is either the ~0.8 m
+  marker or a glimpse of an end zone broken up by splash (P012's start read
+  20 m out as a "marker"). Both readings are kept; the start position most
+  sightings agree on wins (`_consensus`, within 1.5 m).
+- *Things that move with the camera.* A red run that stays at a fixed
+  distance from the swimmer is not a marking (P004: approached at 0.4
+  repeats/s while the swimmer covered 15 m). Sightings are grouped into
+  episodes; an episode whose implied start position drifts more than 0.5
+  per metre swum is dropped (real markings: 0.0-0.33; spurious 0.6-1.5).
+- *Lens.* The head-to-box-edge offset, converted with the band spacing just
+  outside the box, read 14% long (fitted over 2,207 sightings on 8 clips;
+  behind-the-swimmer readings sat 0.1-1.0 m above ahead readings on every
+  clip): the wide-angle lens shrinks bands away from the picture's centre.
+  `head_offset_scale: 0.874` corrects it.
+- *Error estimate, per moment* (`pool_position_err_m`): the largest
+  deviation of an agreeing substantial episode (20+ sightings) from the
+  result, floor 0.5 m, plus 4% of the distance swum outside the stretch the
+  markings cover (the rope distance's worst measured scale error, P012).
+  Reported where within 2.5 m (5% of the length).
+Result on 8 clips: placed for 99-100% of every swim, error +-0.5-1.9 m
+(+-2.5 m at P027's push-off); independent markings agree within 0.1-0.8 m.
+Ground truth (P012, hand-measured on full-resolution frames, +-0.5 m):
+0.49 m off where it claims +-0.63 m; 1.42 m off where it claims +-1.19 m.
+Rejected along the way: refitting the scale from two markings ~19 m apart
+(pins it only to +-5%; P012's fit came out +4.6% and doubled its end
+error).
 
 ## 9. Performance
 

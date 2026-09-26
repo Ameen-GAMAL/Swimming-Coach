@@ -8,6 +8,10 @@ read it before changing anything under "Fixed decisions" (section 3).
 
 This is a proof of concept, not the production system.
 
+**Version:** see `src/__init__.py`; what changed in each version is in
+[CHANGELOG.md](CHANGELOG.md), and each is tagged `vX.Y.Z` in git. Every
+output carries the version that produced it.
+
 **Requires an NVIDIA GPU (CUDA).** Every stage runs on `device=0` and there
 is no CPU fallback — this will not run on a machine without one.
 
@@ -295,7 +299,13 @@ navy/white bands as they pass the swimmer's head, on both sides of the
 swimmer (CLAUDE.md section 8.11). Band length `pool.rope_band_m` (0.39 m)
 was calibrated against the pool's red 5 m and mid-pool markings on two
 clips, which it then matches to within ~2%. Prints the distance, time and
-speed; caches its readings under `cache/rope/`.
+speed; caches its readings under `cache/rope/`. It also records the rope's
+red markings (5 m from each wall, and mid-pool), which place the swimmer in
+the length: every swim and split row carries its start and end position in
+metres from the wall being swum away from, to within about ±1 m. Where the
+bands can't be counted — the solid red last 5 m at each end, or bands hidden
+by splash — the rope's movement comes from the pattern of individual float
+discs instead (agrees with the band count to within ~2%).
 
 ### Metrics
 
@@ -470,10 +480,10 @@ measurement. Two more, found while building detection/tracking (Phase 4):
     accuracy. Result: ~365MB for the same clip (extrapolated from a 900-frame
     test render), a ~6x reduction.
 
-11. **Distance needs the lane rope behind the swimmer in view.** It is
-    read off the rope's bands; where the rope can't be followed for most of
-    a stretch, that stretch keeps its stroke timing but reports no distance
-    or speed. Band length is calibrated (0.39 m, not the 0.3 m first
+11. **Distance needs a lane rope beside the swimmer in view.** It is read
+    off the rope's bands, or its float discs where the bands can't be
+    counted; where no rope can be followed for most of a stretch, that
+    stretch keeps its stroke timing but reports no distance or speed. Band length is calibrated (0.39 m, not the 0.3 m first
     assumed -- see config.yaml) against the red 5 m and mid-pool markings;
     confirming it with a tape measure on the rope would tighten it. The
     rope lies ~1.25 m beyond the swimmer, so distance is exact while the

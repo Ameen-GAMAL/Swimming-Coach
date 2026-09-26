@@ -33,6 +33,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
+from src import __version__
 from src.detect_track import run_detect_track_cached, subject_track_ids
 from src.events import load_calibration, run_events_cached
 from src.metrics import run_metrics_cached, subject_strokes
@@ -87,7 +88,7 @@ def summarise_run(video_path, config, calibration_dir="data/calibration"):
     cap.release()
 
     frames_detected = int(tracks_df["frame"].nunique()) if not tracks_df.empty else 0
-    subject_ids = subject_track_ids(tracks_df, config["events"]["min_track_frames_for_analysis"])
+    subject_ids = subject_track_ids(tracks_df)
     subject_df = tracks_df[tracks_df["track_id"].isin(subject_ids)] if not tracks_df.empty else tracks_df
     subject_frames = int(subject_df["frame"].nunique()) if not subject_df.empty else 0
     track_sizes = subject_df["track_id"].value_counts() if not subject_df.empty else pd.Series(dtype=int)
@@ -173,6 +174,7 @@ def summarise_run(video_path, config, calibration_dir="data/calibration"):
         "headline_cpm": cpm_swim if cpm_swim is not None else (
             med("stroke_rate_spm", multi) / 2 if med("stroke_rate_spm", multi) is not None else None),
         "rope_measured_pct": float(metrics_diag.get("rope_measured_pct", 0.0)),
+        "rope_texture_pct": float(metrics_diag.get("rope_texture_pct", 0.0)),
         "stroke_capture_pct": (float(np.average(swims["stroke_capture_pct"].dropna(),
                                                 weights=swims.loc[swims["stroke_capture_pct"].notna(), "duration_sec"]))
                                if len(swims) and "stroke_capture_pct" in swims and swims["stroke_capture_pct"].notna().any()
@@ -180,6 +182,11 @@ def summarise_run(video_path, config, calibration_dir="data/calibration"):
         "person_found_pct": float(pose_diag.get("quality_person_found_pct", 0.0)),
         "rope_side_disagreements": int(metrics_diag.get("rope_side_disagreements", 0)),
         "splits_df": splits,
+        "position_fixes": metrics_diag.get("position_fixes", []),
+        "swim_start_position_m": (float(swims["start_position_m"].iloc[0])
+                                  if len(swims) and "start_position_m" in swims and pd.notna(swims["start_position_m"].iloc[0]) else None),
+        "swim_end_position_m": (float(swims["end_position_m"].iloc[-1])
+                                if len(swims) and "end_position_m" in swims and pd.notna(swims["end_position_m"].iloc[-1]) else None),
         "scale_method": calib.get("scale_method", "unknown"),
         "visible_span_m": float(calib.get("corner_span_m", {}).get("end_m", 0.0)),
         "scale_clamped": bool(calib.get("scale_estimate_clamped_to_prior", False)),
@@ -302,8 +309,10 @@ def observations(s, config):
 
     # distance and speed
     if s["swim_speed_ms"] is not None:
+        where = (f", from {s['swim_start_position_m']:.0f} m to {s['swim_end_position_m']:.0f} m into the length"
+                 if s["swim_start_position_m"] is not None and s["swim_end_position_m"] is not None else "")
         line = (f"The swimmer covered {s['swim_distance_m']:.1f} m in {s['swim_time_sec']:.1f} s of continuous "
-                f"swimming, an average of {s['swim_speed_ms']:.2f} m/s")
+                f"swimming{where}, an average of {s['swim_speed_ms']:.2f} m/s")
         if s["swim_dpc_m"] is not None:
             line += (f", travelling {s['swim_dpc_m']:.2f} m with each full stroke cycle at "
                      f"{s['swim_cycle_rate_cpm']:.0f} cycles per minute")
@@ -666,11 +675,16 @@ def build_report(video_path, config, calibration_dir="data/calibration", output_
                 doc.add_picture(chart, width=Inches(6.4))
         split_rows = []
         for r in splits.sort_values("start_sec").itertuples():
-            split_rows.append([f"{r.start_sec:.1f} – {r.end_sec:.1f} s", fmt(r.distance_m, 1),
+            a, b = getattr(r, "start_position_m", None), getattr(r, "end_position_m", None)
+            where = f"{a:.0f} – {b:.0f} m" if a is not None and b is not None and pd.notna(a) and pd.notna(b) else "—"
+            split_rows.append([f"{r.start_sec:.1f} – {r.end_sec:.1f} s", where, fmt(r.distance_m, 1),
                                fmt(r.average_speed_ms, 2), fmt(r.cycle_rate_cpm, 0), fmt(r.distance_per_cycle_m, 2)])
-        add_table(doc, ["Split", "Distance (m)", "Speed (m/s)", "Tempo (cycles/min)", "Distance per cycle (m)"],
-                  split_rows, col_widths=[1.4, 1.1, 1.1, 1.4, 1.7])
-        caption(doc, "Distance is measured against the lane rope's coloured bands as they pass the swimmer. "
+        add_table(doc, ["Split", "In the length", "Distance (m)", "Speed (m/s)", "Tempo (cycles/min)",
+                        "Distance per cycle (m)"],
+                  split_rows, col_widths=[1.2, 1.1, 0.9, 0.9, 1.2, 1.3])
+        caption(doc, "Distance is measured against the lane rope's coloured bands as they pass the swimmer; "
+                     "'In the length' is metres from the wall the swimmer is swimming away from, placed by the "
+                     "rope's red markings (5 m from each wall, and mid-pool). "
                      "Distance per cycle is how far one full two-arm stroke cycle carries the swimmer: speed "
                      "divided by cycle rate. A split needs 3 strokes before its tempo is timed.")
 
@@ -741,7 +755,8 @@ def build_report(video_path, config, calibration_dir="data/calibration", output_
     doc.add_paragraph()
     caption(doc, f"Produced automatically from {s['video']}. Timing comes from the video's own timestamps at "
                  f"{s['fps']:.0f} frames per second, distance from the lane rope's coloured bands; the swimmer "
-                 f"was in view and tracked for {s['subject_coverage_pct']:.0f}% of the clip.")
+                 f"was in view and tracked for {s['subject_coverage_pct']:.0f}% of the clip. "
+                 f"Pipeline version {__version__}.")
 
     doc.save(out_path)
     return out_path

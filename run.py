@@ -5,6 +5,7 @@
 import argparse
 import os
 
+from src import __version__
 from src.calibrate import calibrate_video
 from src.detect_track import run_detect_track_cached
 from src.events import run_events_cached
@@ -24,6 +25,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)  # fails loudly if config.yaml is missing or malformed
+    print(f"Swimming POC pipeline v{__version__}")
     stem = os.path.splitext(os.path.basename(args.video))[0]
     timers = {}
     if not os.path.exists(os.path.join("data", "calibration", f"{stem}.json")):

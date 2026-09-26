@@ -736,7 +736,7 @@ SUBJECT_MIN_PRIMARY_FRAC = 0.5   # share of a track's frames in which it is the 
 SUBJECT_MIN_AREA_FRAC = 0.5      # its median box area relative to the largest-boxed substantial track
 
 
-def subject_track_ids(tracks_df, min_track_frames):
+def subject_track_ids(tracks_df):
     """The tracks that belong to the filmed swimmer, as opposed to other
     people in the pool.
 
@@ -750,14 +750,21 @@ def subject_track_ids(tracks_df, min_track_frames):
     their strokes folded into "the swimmer's" tempo. On P004, P022 and
     P023 the excluded tracks sat at 22-45% of the subject's box size and
     were the largest box in 1-27% of their frames; the subject's own
-    substantial tracks sat at 61%+ and 76%+."""
+    substantial tracks sat at 61%+ and 76%+.
+
+    The size reference is the DOMINANT track -- the one that is the largest
+    box on screen in the most frames. It used to be the largest-boxed
+    substantial track, and on DIVE_P027 a 0.7 s burst of very large boxes at
+    the start (the camera right beside the swimmer) set it so high that the
+    swimmer's own 34 s track fell below half of it: 352 of the clip's 5,749
+    frames were attributed to the swimmer instead of 5,208. The other six
+    tested clips select exactly the same tracks either way."""
     if tracks_df.empty:
         return set()
     d = tracks_df.assign(area=(tracks_df["x2"] - tracks_df["x1"]) * (tracks_df["y2"] - tracks_df["y1"]))
     primary = d.loc[d.groupby("frame")["area"].idxmax(), "track_id"].value_counts()
     g = d.groupby("track_id").agg(n=("frame", "size"), med_area=("area", "median"))
-    substantial = g[g["n"] >= min_track_frames]
-    ref = substantial["med_area"].max() if len(substantial) else g["med_area"].max()
+    ref = g.loc[primary.idxmax(), "med_area"]
     primary_frac = primary.reindex(g.index).fillna(0) / g["n"]
     keep = (primary_frac >= SUBJECT_MIN_PRIMARY_FRAC) & (g["med_area"] >= SUBJECT_MIN_AREA_FRAC * ref)
     return set(g.index[keep])

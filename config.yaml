@@ -210,3 +210,20 @@ rope_odometry:
   side_agreement_repeats: 0.03  # both sides of the swimmer see the same rope; readings further apart than this (navy+white repeats per sample; ~0.05 is typical motion) are not trusted
   max_step_repeats: 0.3         # a rope movement larger than this (repeats) between readings is a mismatch, not motion
   max_bridge_sec: 1.0         # readings missing for up to this long are bridged with the neighbouring speed; longer gaps break the measurement
+  record_markings: true       # also record where the red rope markings sit (pool_position below); part of the cache key
+
+pool_position:
+  # Metres into the length, from the red rope markings (see
+  # rope_odometry.pool_position): end-zone boundaries and the mid-pool marker.
+  max_landmark_distance_m: 6.0   # use a marking only while it is within this distance of the swimmer's head -- counting bands further out adds error
+  min_landmark_samples: 5        # sightings needed before a marking is trusted
+  marker_max_len_m: 2.0          # a red run this short (both ends seen) may be the ~1 m mid-pool marker OR a partial glimpse of an end zone -- both readings are tested; longer runs can only be zones
+  head_offset_scale: 0.874        # lens correction for the head-to-box-edge part of a marking's distance (fitted: that part read 1/0.874 = 14% long; see _marking_sightings)
+  base_uncertainty_m: 0.5        # floor on the reported error: the head is placed from the box (~0.3 m) and the marker's centring on 25 m is assumed
+  max_uncertainty_m: 2.5         # positions are reported only where their error estimate is within this (5% of a 50 m length)
+  episode_gap_sec: 1.0           # sightings of a marking more than this apart start a new episode
+  max_episode_drift: 0.5         # a real marking is fixed on the rope: its implied start position may drift at most this much per metre swum. Measured: real markings 0.0-0.33 (the box edge the distance is counted from moves with the arm), spurious runs travelling with the camera 0.6-1.5
+  max_episode_scatter_m: 1.0     # ...and scatter at most this much (median absolute deviation) within an episode
+  drift_pct: 4.0                 # the error grows by this share of the distance swum outside the stretch the markings cover (the rope distance matched landmarks to within 4.1% on the worst clip, P012)
+  consensus_tol_m: 1.5           # sighting episodes whose implied start positions agree within this count as agreeing
+  substantial_episode_n: 20      # only episodes with this many sightings set the error estimate (smaller ones still vote)
